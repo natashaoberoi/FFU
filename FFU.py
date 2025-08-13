@@ -223,7 +223,14 @@ def _check_cuda():
         raise RuntimeError("CUDA required to run this model")
 def coco_name(iid: int) -> str:
     return f"COCO_train2014_{iid:012d}.jpg"
-    
+
+def encode_text_clip(txt, ctx_len: int = 77) -> torch.LongTensor:
+    if isinstance(txt, str):
+        toks = clip_tok([txt], context_length=ctx_len)   # (1,77)
+        return toks[0]
+    else:
+        return clip_tok(txt, context_length=ctx_len)     # (B,77)
+        
 # Classes
 class CLIPFiLM(nn.Module):
     """

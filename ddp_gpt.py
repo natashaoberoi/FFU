@@ -39,7 +39,7 @@ torch.manual_seed(42)
 sys.path.insert(0, "/scratch/zt1/project/msml612/user/noberoi1/my_site_packages")
 
 # Project imports
-from FFU import UTransformer, GRefDataset, coco_name
+from FFU import UTransformer, GRefDataset, coco_name, encode_text_clip
 
 # Tokenizers
 from transformers import AutoTokenizer
@@ -211,12 +211,6 @@ def backbone_pool(model: UTransformer, x: torch.Tensor) -> torch.Tensor:
         feat = x3.mean(dim=(2, 3))
     return feat
 
-def encode_text_clip(txt, ctx_len: int = 77) -> torch.LongTensor:
-    if isinstance(txt, str):
-        toks = clip_tok([txt], context_length=ctx_len)   # (1,77)
-        return toks[0]
-    else:
-        return clip_tok(txt, context_length=ctx_len)     # (B,77)
 
 def dice_loss(logits, gt, eps=1.):
     p = torch.sigmoid(logits.float()); gt = gt.float()
