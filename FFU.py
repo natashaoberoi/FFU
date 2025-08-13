@@ -35,6 +35,8 @@ from torch.utils.data import Dataset
 from torch import amp
 import numpy as np
 
+IMG_SIZE   = 512
+
 # Functions
 def s2p(
         x: torch.Tensor,
@@ -230,7 +232,7 @@ def encode_text_clip(txt, ctx_len: int = 77) -> torch.LongTensor:
         return toks[0]
     else:
         return clip_tok(txt, context_length=ctx_len)     # (B,77)
-        
+
 # Classes
 class CLIPFiLM(nn.Module):
     """
