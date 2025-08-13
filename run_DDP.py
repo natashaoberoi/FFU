@@ -22,6 +22,7 @@ from tqdm.auto import tqdm
 from collections import defaultdict as _dd
 import matplotlib.pyplot as plt
 import numpy as np
+import csv
 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -33,6 +34,20 @@ import traceback
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
+
+sys.path.insert(0, '/scratch/zt1/project/msml612/user/noberoi1/open_clip_package')
+import open_clip
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model, _, _ = open_clip.create_model_and_transforms(
+    'ViT-B-32',
+    pretrained='/scratch/zt1/project/msml612/user/noberoi1/open_clip/models--laion--CLIP-ViT-B-32-laion2B-s34B-b79K/open_clip_pytorch_model.bin',
+    cache_dir='/scratch/zt1/project/msml612/user/noberoi1/open_clip'
+)
+clip_model = clip_model.eval().to(device)
+clip_tok = open_clip.get_tokenizer(
+    'ViT-B/32',
+    cache_dir='/scratch/zt1/project/msml612/user/noberoi1/open_clip'
+)
 
 def setup_ddp(rank, world_size):
     dist.init_process_group(
@@ -46,8 +61,6 @@ def setup_ddp(rank, world_size):
 def cleanup_ddp():
     dist.destroy_process_group()
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# print(device)
 
 sys.path.insert(0, "/scratch/zt1/project/msml612/user/noberoi1/my_site_packages")
 from transformers import AutoTokenizer
@@ -170,6 +183,7 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 
 start_epoch            = 1
 best_val               = float("inf")
+save_best              = False # EDITED
 patience               = 0
 extra_clip_unfrozen    = False        # will flip later
 
@@ -183,6 +197,7 @@ if CKPT_FILE.exists():
 
     start_epoch         = state["epoch"] + 1
     best_val            = state["best_val"]
+    save_best              = False # EDITED
     patience            = state["patience"]
     extra_clip_unfrozen = state["extra_unfrozen"]
 
@@ -196,7 +211,6 @@ if CKPT_FILE.exists():
                 p.requires_grad_(True)
 
     print(f"↪︎ resumed from epoch {state['epoch']}  (best val = {best_val:.4f})")
-
 
 
 # ─ Freeze entire CLIP text tower first
@@ -347,8 +361,6 @@ def mask_area_loss(pred, gt):
     area_g = gt.mean((2,3))
     return F.binary_cross_entropy(area_p, area_g)
 
-
-
 # Centre‑of‑Mass Alignment
 def com_alignment_loss(pred, gt, eps=1e-6):
     """
@@ -390,7 +402,7 @@ patience = 0
 extra_clip_unfrozen = False
 PATIENCE_MAX = 10          # or any value you like
 
-def save_checkpoint(ep: int, *, keep_history: bool = True):
+def save_checkpoint(ep: int, *, keep_history: bool = False, save_best = False): # EDITED
     state = {
         "epoch"          : ep,
         "model"          : model_to.state_dict(),
@@ -404,6 +416,8 @@ def save_checkpoint(ep: int, *, keep_history: bool = True):
     }
 
     torch.save(state, CKPT_FILE)                    # always overwrites
+    if save_best:
+        torch.save(state, CKPT_DIR / "best.pt") # EDITED
     if keep_history:
         torch.save(state, CKPT_DIR / f"epoch_{ep:03d}.pt")
         
@@ -708,6 +722,7 @@ def main_worker(rank, world_size):
             p.requires_grad_(True)
 
         for ep in range(start_epoch, EPOCHS + 1):
+            print(f"\n[Rank {rank}] Starting Epoch {ep}/{EPOCHS}")
             train_sampler.set_epoch(ep)
 
             if torch.cuda.is_available():
@@ -897,8 +912,8 @@ def main_worker(rank, world_size):
                 else:
                     patience += 1
 
-                # Scheduler step
-                scheduler.step(val_loss)
+            # Scheduler step
+            scheduler.step(val_loss)
 
     except Exception as e:
         print(f"[Rank {rank}] Exception occurred: {e}")
@@ -908,6 +923,7 @@ def main_worker(rank, world_size):
         cleanup_ddp()
 # Training Loop – freeze, accumulation, λ‑warm‑up, sanity plots
 def run_fallback_training(device):
+    global best_val, patience, extra_clip_unfrozen, save_best
     print("[Fallback]: Running Single-GPU Training Loop.")
     global model_to, opt, scheduler, hist, loss_history, start_epoch
     train_dl = DataLoader(
@@ -1190,22 +1206,26 @@ def run_fallback_training(device):
             plt.tight_layout()
             plt.show()
 
-        save_checkpoint(ep)
+        # save_checkpoint(ep)
 
         min_delta   = 1e-4          # how much val must improve
-        best_val    = getattr(best_val, 'value', float('inf'))   # one‑time init
+        # best_val    = getattr(best_val, 'value', float('inf'))   # one‑time init
 
         if val_loss < best_val - min_delta:
             best_val  = val_loss
+            save_best = True
             patience  = 0
         else:
+            save_best = False
             patience += 1
             if patience == 8 and not extra_clip_unfrozen:
                 for blk in model_to.film.clip.transformer.resblocks[-4:]:
                       for p in blk.parameters():
                               p.requires_grad_(True)
-            extra_clip_unfrozen = True
-            print("[INFO] last-4 CLIP blocks unfrozen")
+                extra_clip_unfrozen = True
+                print("[INFO] last-4 CLIP blocks unfrozen")
+        
+        save_checkpoint(ep, keep_history = False, save_best = save_best)
 
         # optional: ReduceLRonPlateau
         scheduler.step(val_loss)
@@ -1272,6 +1292,8 @@ def main():
         )
 
         run_fallback_training(device=device)
+        test_dl = DataLoader(GRefDataset(test_subset, IMG_DIR, IMG_SIZE),
+                     batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
         run_visualization_and_timing(model=model_to, device=device, test_dl=test_dl)
 
 if __name__ == "__main__":
