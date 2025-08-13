@@ -674,10 +674,43 @@ def main_worker(rank, world_size):
         LAMBDA_DIV0, EPOCHS, PATIENCE_MAX = 1.0, 23, 15
         ACC_STEPS = 1
         
-        best_val = float('inf')
-        patience = 0
-        extra_clip_unfrozen = False
+        if rank==0 and CKPT_FILE.exists():
+            print(f"[resume] loading {CKPT_FILE.name}")
+            state            = torch.load(CKPT_FILE, map_location=device)
+
+            model_to.load_state_dict(state["model"])
+            opt.load_state_dict(state["opt"])
+            scheduler.load_state_dict(state["sched"])
+
+            start_epoch         = state["epoch"] + 1
+            best_val            = state["best_val"]
+            save_best              = False # EDITED
+            patience            = state["patience"]
+            extra_clip_unfrozen = state["extra_unfrozen"]
+
+            hist          = state["hist"]          # <-- histories back in memory
+            loss_history  = state["loss_history"]
+
+            # Un-freeze extra blocks if needed
+            if extra_clip_unfrozen:
+                for blk in model_to.film.clip.transformer.resblocks[-4:]:
+                    for p in blk.parameters():
+                        p.requires_grad_(True)
+
+            print(f"↪︎ resumed from epoch {state['epoch']}  (best val = {best_val:.4f})")
+        else:   
+            start_epoch = 1
+            save_best = False
+            best_val = float('inf')
+            patience = 0
+            extra_clip_unfrozen = False
         
+        best_val_t = torch.tensor(best_val, device=device, dtype=torch.float32)
+        patience_t = torch.tensor(patience, device=device, dtype=torch.long)
+        unfrozen_t = torch.tensor(1 if extra_clip_unfrozen else 0, device=device, dtype=torch.long)
+        dist.broadcast(best_val_t, src=0); dist.broadcast(patience_t, src=0); dist.broadcast(unfrozen_t, src=0)
+        best_val = float(best_val_t.item()); patience = int(patience_t.item()); extra_clip_unfrozen = bool(unfrozen_t.item())
+
         freeze_backbone(model_ddp.module, True)
 
         best, patience = math.inf, 0
