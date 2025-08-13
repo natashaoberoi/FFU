@@ -215,13 +215,15 @@ def film_apply(x: torch.Tensor,
     """
     gain = log_gain.exp()                 # ensures ≥1.0
     return gain * (gamma * x + beta)
-    
+
 def _check_cuda():
     # NOTE: Enforcing CUDA at import‑time restricts portability; consider letting the caller
     #       decide the device and moving tensors accordingly instead of hard‑failing.
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required to run this model")
-
+def coco_name(iid: int) -> str:
+    return f"COCO_train2014_{iid:012d}.jpg"
+    
 # Classes
 class CLIPFiLM(nn.Module):
     """

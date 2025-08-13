@@ -1,5 +1,5 @@
 import regex
-from FFU import UTransformer, GRefDataset
+from FFU import UTransformer, GRefDataset, coco_name
 import sys
 sys.path.insert(0, "/scratch/zt1/project/msml612/user/noberoi1/my_site_packages")
 import torch
@@ -26,6 +26,7 @@ import numpy as np
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from torch.utils.data import DistributedSampler
 import torch.multiprocessing as mp
 import traceback
 
@@ -101,9 +102,6 @@ def _probe_gamma_beta(clip_tok_batch: torch.Tensor):
 # Parse gRefCOCO to Build Full Train / Test Lists
 with open(GREF_JSON) as f:
     gref = json.load(f)
-
-def coco_name(iid: int) -> str:
-    return f"COCO_train2014_{iid:012d}.jpg"
 
 train_entries, test_entries = [], []
 for e in gref:
@@ -606,8 +604,8 @@ def main_worker(rank, world_size):
         )
         
         # Create distributed samplers
-        train_sampler = dist.DistributedSampler(train_subset, num_replicas=world_size, rank=rank, shuffle=True)
-        test_sampler = dist.DistributedSampler(test_subset, num_replicas=world_size, rank=rank, shuffle=False)
+        train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank, shuffle=True)
+        test_sampler = DistributedSampler(test_subset, num_replicas=world_size, rank=rank, shuffle=False)
         
         train_dl = DataLoader(
             GRefDataset(train_subset, IMG_DIR, IMG_SIZE),
