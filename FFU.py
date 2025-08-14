@@ -39,10 +39,10 @@ IMG_SIZE   = 512
 
 # Functions
 def s2p(
-        x: torch.Tensor,
-        n_bins: int,
-        pad_mode: str = "zeros",
-    ) -> Tuple[torch.Tensor, int]:
+    x: torch.Tensor,
+    n_bins: int,
+    pad_mode: str = "zeros",
+) -> Tuple[torch.Tensor, int]:
     """
     Serial-to-Parallel: split a B×L×D sequence into B×n_bins×R×D, with
     optional right-padding when L is not divisible by n_bins.
@@ -163,11 +163,11 @@ def ifft_chunked(
 #  Corrected IIR filter-bank
 # --------------------------------------------------------------------------- #
 def apply_iir_bank(
-        X_f: Tensor,           # (B, N_bins, Freq, D)  complex
-        theta: Tensor,         # (B, N_bins, F, D, 2)  real in (0,1)
-        R: int,                # chunk length (time-domain)
-        causal: bool = True,
-    ) -> Tensor:
+    X_f: Tensor,           # (B, N_bins, Freq, D)  complex
+    theta: Tensor,         # (B, N_bins, F, D, 2)  real in (0,1)
+    R: int,                # chunk length (time-domain)
+    causal: bool = True,
+) -> Tensor:
     B, N, Freq, D = X_f.shape
     B2, N2, F,  D2, two = theta.shape
     assert (B2, N2, D2, two) == (B, N, D, 2), "Θ shape mismatch"
@@ -233,6 +233,14 @@ def encode_text_clip(txt, ctx_len: int = 77) -> torch.LongTensor:
     else:
         return clip_tok(txt, context_length=ctx_len)     # (B,77)
 
+def ann_ids_to_mask(ann_ids, wh):
+    W, H = wh
+    m = np.zeros((H, W), np.uint8)
+    for aid in ann_ids:
+        if aid in coco.anns:
+            m |= coco.annToMask(coco.anns[aid]).astype(np.uint8)
+    return m
+
 # Classes
 class CLIPFiLM(nn.Module):
     """
@@ -261,6 +269,7 @@ class CLIPFiLM(nn.Module):
         # learnable global gain = how “loud” the text modulation is
         self.film_gain = nn.Parameter(torch.tensor(2.0))
 
+    # ------------------------------------------------------------------
     def _init_gamma_bias(self):
         last = self.mlp[-1]
         nn.init.zeros_(last.weight)
@@ -269,6 +278,7 @@ class CLIPFiLM(nn.Module):
         with torch.no_grad():
             last.bias[:sum(self.enc_ch)] = 1.0
 
+    # ------------------------------------------------------------------
     def forward(self, clip_tokens):
         """
         clip_tokens: (B, 77) already tokenised by CLIP’s tokenizer.
@@ -342,6 +352,7 @@ class TwinCLIPFiLM(nn.Module):
         # global learnable gain
         # self.log_gain = nn.Parameter(torch.zeros(()))   # starts at gain = 1
 
+    # --------------------------------------------------------------
     def _split(self, vec, ch_list):
         """split  (B, ΣC)  →  list[(B,C,1,1), …]"""
         outs, idx = [], 0
@@ -350,6 +361,7 @@ class TwinCLIPFiLM(nn.Module):
             idx += C
         return outs
 
+    # --------------------------------------------------------------
     def forward(self, clip_tokens):
         with torch.no_grad():
             z = self.clip.encode_text(clip_tokens)      # (B,512)
@@ -360,10 +372,10 @@ class TwinCLIPFiLM(nn.Module):
         γ_enc, β_enc = torch.chunk(enc_vec, 2, dim=-1)
         γ_dec, β_dec = torch.chunk(dec_vec, 2, dim=-1)
 
-        gammas_enc = self._split(γ_enc, self.enc_ch)
-        betas_enc  = self._split(β_enc, self.enc_ch)
-        gammas_dec = self._split(γ_dec, self.dec_ch)
-        betas_dec  = self._split(β_dec, self.dec_ch)
+        gammas_enc = [t.contiguous() for t in self._split(γ_enc, self.enc_ch)]
+        betas_enc  = [t.contiguous() for t in self._split(β_enc, self.enc_ch)]
+        gammas_dec = [t.contiguous() for t in self._split(γ_dec, self.dec_ch)]
+        betas_dec  = [t.contiguous() for t in self._split(β_dec, self.dec_ch)]
 
         return gammas_enc, betas_enc, gammas_dec, betas_dec
 
@@ -618,7 +630,8 @@ class FocusLayer(nn.Module):
             nn.Dropout(dropout),
         )
 
-    #  Forward
+    # --------------------------------------------------------------------- #
+    #  forward
     # --------------------------------------------------------------------- #
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -661,6 +674,9 @@ class FocusLayer(nn.Module):
 
         return y_out
 
+# ───────────────────────────────────────────────────────────────
+# Focus ×3 → FiLM (γ, β) generator  – with learnable scaling
+# ───────────────────────────────────────────────────────────────
 class FocusFiLM(nn.Module):
     def __init__(
         self,
@@ -1005,7 +1021,9 @@ class UTransformer(nn.Module):
             nn.Conv2d(c0, num_classes, 3, padding=1)     # no BN/ReLU here
         )
 
-        
+        # keep channel counts handy for aux heads
+        self.c3_channels = c3
+    # -----------------------------------------------------------------------------
     # U‑Transformer ‑‑ new forward that consumes TwinCLIPFiLM
     # -----------------------------------------------------------------------------
     def forward(self,
@@ -1014,13 +1032,20 @@ class UTransformer(nn.Module):
               ) -> torch.Tensor:
         H_in, W_in = x.shape[-2:]
 
-        # 1. Pad so spatial dimensionss are multiples of 32
+        # ── 1. pad so spatial dims are multiples of 32 ──────────────────────────
         pad_h, pad_w = (-H_in) % 32, (-W_in) % 32
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h))
 
-        # 2. FiLM parameters from CLIP text tower
-        gE, bE, gD, bD = self.film(clip_tokens)   # lists & scalar (gain)
+        # 2. FiLM parameters from CLIP text tower ─────────────────────────────
+        gE, bE, gD, bD = self.film(clip_tokens)   # lists
+        # smooth bounds (keep gradients alive near limits).
+        def _squash_list(xs, lo, hi):
+            mid  = 0.5 * (hi + lo)
+            half = 0.5 * (hi - lo)
+            return [mid + half * torch.tanh((x - mid) / half) for x in xs]
+        gE = _squash_list(gE, 0.5, 2.0);  bE = [torch.tanh(x) for x in bE]
+        gD = _squash_list(gD, 0.5, 2.5);  bD = [torch.tanh(x) for x in bD]
 
         # 0)  FULL token sequence **with grad** (do NOT wrap in no_grad)
         txt_tokens = self.film.clip.token_embedding(clip_tokens)      # (B,77,512)
@@ -1029,7 +1054,7 @@ class UTransformer(nn.Module):
             txt_tokens, attn_mask=self.film.clip.attn_mask
         )
 
-        # 3. ENCODER
+        # ── 3. ENCODER ----------------------------------------------------------
         x0 = self.inc(x)
         x0 = self.patch_embed(x0)
         # x0 = gain * (gE[0] * x0 + bE[0])                # stage‑0
@@ -1047,40 +1072,40 @@ class UTransformer(nn.Module):
         # x3 = gain * (gE[3] * x3 + bE[3])                # stage‑3
         x3 = film_apply(x3, gE[3], bE[3], self.film_gain_log)
 
-        # 4. Bottleneck (MHSA)
+        # ── 4. Bottleneck (MHSA) -------------------------------------------------
         x4 = self.mhsa(x3)
 
-        # gate‑3
+        # --- gate‑3 --------------------------------------------------------------
         s3 = self.mhca3(S=x2, Y=x4)                      # (B,2c2,H/4,W/4)
         s3, ent3 = self.xattn3(s3, txt_tokens)
         self.attn_entropy.append(ent3.item())
         s3 = film_apply(s3, gD[0], bD[0], self.film_gain_log)
         x  = self.up3(x4, s3)
-        
-        # gate‑2
+        # --- gate‑2 --------------------------------------------------------------
         s2 = self.mhca2(S=x1, Y=x)
         s2, ent2 = self.xattn2(s2, txt_tokens)
         self.attn_entropy.append(ent2.item())
         s2 = film_apply(s2, gD[1], bD[1], self.film_gain_log)
         x  = self.up2(x, s2)
-        # gate‑1
+        # --- gate‑1 --------------------------------------------------------------
         s1 = self.mhca1(S=x0, Y=x)
         s1, ent1 = self.xattn1(s1, txt_tokens)
         self.attn_entropy.append(ent1.item())
         s1 = film_apply(s1, gD[2], bD[2], self.film_gain_log)
         x  = self.up1(x, s1)
 
-        # 5. Upsample back to input resolution & final head
+        # ── 6. Upsample back to input resolution & final head -------------------
         x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=False)
         if pad_h or pad_w:
             x = x[..., :H_in, :W_in]
 
-        return torch.sigmoid(self.refine(x))            # refine‑head → 1‑ch prob‑map
+        # return torch.sigmoid(self.refine(x))            # refine‑head → 1‑ch prob‑map
+        return self.refine(x)                           # return logits
 
 class GRefDataset(Dataset):
     def __init__(self, entries, img_dir, img_size):
         self.samples, self.img_dir, self.img_size = [], img_dir, img_size
-        self._wh = {}
+        self._wh_ = {}
         for e in entries:
             path = os.path.join(img_dir, coco_name(e["image_id"]))
             if not os.path.isfile(path): continue
@@ -1095,9 +1120,9 @@ class GRefDataset(Dataset):
         if not self.samples: raise RuntimeError("No samples")
     def __len__(self): return len(self.samples)
     def _wh(self, iid, path):
-        if iid not in self._wh:
-            with Image.open(path) as im: self._wh[iid]=im.size
-        return self._wh[iid]
+        if iid not in self._wh_:
+            with Image.open(path) as im: self._wh_[iid]=im.size
+        return self._wh_[iid]
     def __getitem__(self, idx):
         s = self.samples[idx]
         img = Image.open(s["path"]).convert("RGB").resize(
