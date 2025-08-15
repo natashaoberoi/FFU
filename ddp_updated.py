@@ -125,7 +125,7 @@ CLIP_NORM_AFTER_UNFREEZE = 0.5
 SIGMA_TOL_FOR_TXT_LR     = 20.0
 
 # Scheduler / early stop
-EPOCHS        = 23
+EPOCHS        = 5
 PATIENCE_MAX  = 15
 min_delta     = 1e-4
 
@@ -484,7 +484,7 @@ def run_visualization_and_timing(model, device, test_dl):
 
     for iid in preds:
         base = bases[iid]
-        print(f"\n=== Test Image {iid} ===")
+        # print(f"\n=== Test Image {iid} ===")
         for prob, gt_mask, caption in zip(preds[iid], gts[iid], caps[iid]):
             pred_bin = (prob > 0.5).astype(np.uint8)
             plt.figure(figsize=(10, 4))
@@ -495,6 +495,10 @@ def run_visualization_and_timing(model, device, test_dl):
             plt.suptitle(caption, y=0.95)
             plt.tight_layout()
             plt.show()
+            os.makedirs("artifacts/vis", exist_ok=True)
+            out_path = os.path.join("artifacts/vis", f"{iid}_cap{len(preds[iid])-1}.png")
+            plt.savefig(out_path, dpi=150)
+            # print(f"[viz] saved {out_path}")
             plt.close()
 
 # ---------------------------------------------------------------------
