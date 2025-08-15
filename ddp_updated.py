@@ -494,7 +494,6 @@ def run_visualization_and_timing(model, device, test_dl):
             plt.imshow(overlay_mask(pred_bin, base)); plt.axis('Off'); plt.title("Prediction")
             plt.suptitle(caption, y=0.95)
             plt.tight_layout()
-            plt.show()
             os.makedirs("artifacts/vis", exist_ok=True)
             out_path = os.path.join("artifacts/vis", f"{iid}_cap{len(preds[iid])-1}.png")
             plt.savefig(out_path, dpi=150)
@@ -1170,7 +1169,11 @@ if __name__ == "__main__":
         plt.plot(epochs, loss_history["val"],     label="val")
         plt.plot(epochs, loss_history["shuffle"], label="caption shuffle")
         plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend(); plt.title("Loss curves")
-        plt.tight_layout(); plt.show()
+        plt.tight_layout()
+        os.makedirs("artifacts/plots", exist_ok=True)
+        out_path = os.path.join("artifacts/plots", f"loss_curve_ep{len(epochs)}.png")
+        plt.savefig(out_path, dpi=150)
+        plt.close()
 
         # 2) γ / β evolution
         for s in range(4):
@@ -1183,7 +1186,10 @@ if __name__ == "__main__":
                 plt.errorbar(epochs, γμ, yerr=γσ, label="γ", capsize=3)
                 plt.errorbar(epochs, βμ, yerr=βσ, label="β", capsize=3)
                 plt.axhline(1); plt.axhline(0)
-                plt.title(f"Encoder stage {s} γ/β"); plt.tight_layout(); plt.show()
+                plt.title(f"Encoder stage {s} γ/β"); plt.tight_layout()
+                out_path = os.path.join("artifacts/plots", f"encoder_stage_{s}_ep{len(epochs)}.png")
+                plt.savefig(out_path, dpi=150)
+                plt.close()
 
         for s in range(3):
             γμ = [row[s] for row in hist.get("dec_γμ", [])] if len(hist.get("dec_γμ", [])) else []
@@ -1195,14 +1201,23 @@ if __name__ == "__main__":
                 plt.errorbar(epochs, γμ, yerr=γσ, label="γ", capsize=3)
                 plt.errorbar(epochs, βμ, yerr=βσ, label="β", capsize=3)
                 plt.axhline(1); plt.axhline(0)
-                plt.title(f"Decoder gate {s} γ/β"); plt.tight_layout(); plt.show()
+                plt.title(f"Decoder gate {s} γ/β"); plt.tight_layout()
+                os.makedirs("artifacts/plots", exist_ok=True)
+                out_path = os.path.join("artifacts/plots", f"decoder_gate_{s}_ep{len(epochs)}.png")
+                plt.savefig(out_path, dpi=150)
+                plt.close()
 
         if "log_gain" in hist and len(hist["log_gain"]):
             plt.figure(figsize=(6,3))
             plt.plot(epochs, [math.exp(lg) for lg in hist["log_gain"]], label="global gain")
             if len(hist.get("xattn_H", [])):
                 plt.plot(epochs, hist["xattn_H"], label="X-Attn entropy ↓")
-            plt.legend(); plt.xlabel("epoch"); plt.tight_layout(); plt.show()
+            plt.legend(); plt.xlabel("epoch"); plt.tight_layout()
+            os.makedirs("artifacts/plots", exist_ok=True)
+            out_path = os.path.join("artifacts/plots", f"log_gain_curve_ep{len(epochs)}.png")
+            plt.savefig(out_path, dpi=150)
+            print(f"[plot] saved {out_path}")
+            plt.close()
 
     # Optional final quick eval visualization
     if CKPT_FILE.exists():
