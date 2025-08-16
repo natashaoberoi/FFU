@@ -19,6 +19,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import DistributedSampler
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from contextlib import nullcontext
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -26,6 +27,8 @@ import torch.multiprocessing as mp
 # DDP env defaults for mp.spawn + init_method='env://'
 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
 os.environ.setdefault("MASTER_PORT", "29500")
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")  # fail fast on collectives
 torch.backends.cudnn.benchmark = True
 # ---------------------------------------------------------------------
 
@@ -87,7 +90,7 @@ TRAIN_RATIO  = 0.9
 USE_FULL_DATASET = True
 
 # Batch & accumulation
-PER_RANK_BATCH = 16          # per-GPU mini-batch
+PER_RANK_BATCH = 32          # per-GPU mini-batch
 ACC_STEPS      = 2
 # Run the caption-shuffle probe (full test set, non-sharded) every N epochs
 SHUFFLE_PROBE_EVERY = 5
@@ -124,11 +127,13 @@ CLIP_NORM_AFTER_UNFREEZE = 0.5
 SIGMA_TOL_FOR_TXT_LR     = 20.0
 
 # Scheduler / early stop
-EPOCHS        = 100
-PATIENCE_MAX  = 15
+EPOCHS        = 30
+PATIENCE_MAX  = 10
 min_delta     = 1e-4
 
 WARMUP_EPOCHS = 2
+
+SAVE_TEST_VIS = False
 
 # λ-div schedule
 def lambda_div(ep: int, start: float = 0.0, full: float = 1.0, warmup: int = DIV_WARMUP_EPOCHS):
@@ -168,6 +173,21 @@ def log_metrics(epoch, log_gain, xattn_H,
             train_loss, combo_train, val_loss, lambda_div,
             train_time, val_time, peak_gpu_mem_mb
         ])
+
+def _reset_opt_hparams(opt):
+    """
+    Reapply canonical LR/WD to current param groups after a failed opt state load.
+    Assumes param group order: [vision, text, gain].
+    """
+    try:
+        # vision / text / gain groups
+        opt.param_groups[0]["lr"] = LR_IMG
+        opt.param_groups[1]["lr"] = LR_TEXT
+        opt.param_groups[2]["lr"] = LR_GAIN
+        for g in opt.param_groups:
+            g["weight_decay"] = WEIGHT_DECAY
+    except Exception as e:
+        print(f"[resume] (_reset_opt_hparams) warning: {e}")
 
 # ──────────────────────────────
 # Per-epoch 2×2 visualization
@@ -359,6 +379,9 @@ model_to = UTransformer(VOCAB, in_channels=3, num_classes=1,
 TXT_DIM = int(clip_model.text_projection.shape[1])  # usually 512
 C3_DIM  = BASE_CHANNELS * 8                         # matches UTransformer c3 width
 model_to.tv_proj = torch.nn.Linear(C3_DIM, TXT_DIM, bias=False).to(device)
+# tv_proj is used under torch.no_grad() for TV loss features → must stay frozen
+for p in model_to.tv_proj.parameters():
+    p.requires_grad_(False)
 
 # Freeze full CLIP text tower, unfreeze last 2 blocks
 for p in model_to.film.clip.parameters():
@@ -459,7 +482,8 @@ def squash_film_lists(gE, bE, gD, bD):
 
 def freeze_backbone(m, flag=True):
     for name, sub in m.named_children():
-        if name != "film":
+        # Never toggle FiLM (controlled elsewhere) or tv_proj (always frozen)
+        if name not in ("film", "tv_proj"):
             for p in sub.parameters():
                 p.requires_grad_(not flag)
             # Keep BN layers in eval when frozen; train when unfrozen
@@ -577,23 +601,19 @@ def run_visualization_and_timing(model, device, test_dl):
     print(f"\n Average Forward-Pass Time  : {avg_ms:6.2f} ms / image (± {std_ms:4.2f} ms  •  {len(inf_times)} images)")
 
 
-    for iid in preds:
-        base = bases[iid]
-        # print(f"\n=== Test Image {iid} ===")
-        for prob, gt_mask, caption in zip(preds[iid], gts[iid], caps[iid]):
-            pred_bin = (prob > 0.5).astype(np.uint8)
-            plt.figure(figsize=(10, 4))
-            plt.subplot(1, 2, 1)
-            plt.imshow(overlay_mask(gt_mask, base)); plt.axis('Off'); plt.title("Ground Truth")
-            plt.subplot(1, 2, 2)
-            plt.imshow(overlay_mask(pred_bin, base)); plt.axis('Off'); plt.title("Prediction")
-            plt.suptitle(caption, y=0.95)
-            plt.tight_layout()
-            os.makedirs("artifacts/vis", exist_ok=True)
-            out_path = os.path.join("artifacts/vis", f"{iid}_cap{len(preds[iid])-1}.png")
-            plt.savefig(out_path, dpi=150)
-            # print(f"[viz] saved {out_path}")
-            plt.close()
+    # (disabled) Per-image saving is too verbose for large test sets.
+    if SAVE_TEST_VIS:
+        for iid in preds:
+            base = bases[iid]
+            for prob, gt_mask, caption in zip(preds[iid], gts[iid], caps[iid]):
+                pred_bin = (prob > 0.5).astype(np.uint8)
+                plt.figure(figsize=(10, 4))
+                plt.subplot(1, 2, 1); plt.imshow(overlay_mask(gt_mask, base)); plt.axis('Off'); plt.title("Ground Truth")
+                plt.subplot(1, 2, 2); plt.imshow(overlay_mask(pred_bin, base)); plt.axis('Off'); plt.title("Prediction")
+                plt.suptitle(caption, y=0.95); plt.tight_layout()
+                os.makedirs("artifacts/vis", exist_ok=True)
+                out_path = os.path.join("artifacts/vis", f"{iid}_cap{len(preds[iid])-1}.png")
+                plt.savefig(out_path, dpi=150); plt.close()
 
 # ---------------------------------------------------------------------
 # DDP worker
@@ -607,22 +627,27 @@ def main_worker(rank, world_size):
 
         # Model to device and wrap DDP
         model_to.to(dev)
+        # Re-enable unused-param detection to avoid reducer stalls if any param doesn't get grad
         model_ddp = DDP(model_to, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
         # Build datasets (keep handles for DDP caption-shuffle)
         train_dataset = GRefDataset(train_subset, IMG_DIR, IMG_SIZE)
         test_dataset  = GRefDataset(test_subset,  IMG_DIR, IMG_SIZE)
 
-        train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank, shuffle=True)
-        test_sampler  = DistributedSampler(test_subset,  num_replicas=world_size, rank=rank, shuffle=False)
+        # IMPORTANT: samplers must wrap the DATASETS (not the raw lists) to keep per-rank lengths consistent
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank,
+                                          shuffle=True, drop_last=True)
+        test_sampler  = DistributedSampler(test_dataset,  num_replicas=world_size, rank=rank, shuffle=False)
+ 
 
         train_dl = DataLoader(
             train_dataset,
             batch_size=PER_RANK_BATCH,
             sampler=train_sampler,
             num_workers=0,
-            pin_memory=True
-        )
+            pin_memory=True,
+            drop_last=True    # ensure every rank runs the same number of optimizer steps
+         )
         test_dl = DataLoader(
             test_dataset,
             batch_size=PER_RANK_BATCH,
@@ -636,6 +661,12 @@ def main_worker(rank, world_size):
         gain_param   = [model_ddp.module.film_gain_log]
         for n, p in model_ddp.module.named_parameters():
             if p is model_ddp.module.film_gain_log:
+                continue
+            # Freeze tv_proj to avoid "unused" grads; exclude any param with requires_grad=False
+            if n.startswith("tv_proj."):
+                p.requires_grad_(False)
+                continue
+            if not p.requires_grad:
                 continue
             if ("film." in n) or ("embed" in n) or ("xattn" in n):
                 text_params.append(p)
@@ -665,8 +696,17 @@ def main_worker(rank, world_size):
             print(f"[resume] loading {CKPT_FILE.name}")
             state = torch.load(CKPT_FILE, map_location=dev)
             model_ddp.module.load_state_dict(state["model"])
-            opt.load_state_dict(state["opt"])
-            scheduler.load_state_dict(state["sched"])
+            # Try optimizer state; fall back gracefully on group mismatch
+            try:
+                opt.load_state_dict(state["opt"])
+            except Exception as e:
+                print(f"[resume] skipping optimizer state: {e}")
+                _reset_opt_hparams(opt)
+            # Try scheduler state; fall back to fresh scheduler if incompatible
+            try:
+                scheduler.load_state_dict(state["sched"])
+            except Exception as e:
+                print(f"[resume] skipping scheduler state: {e}")
             start_epoch         = int(state.get("epoch", 0)) + 1
             best_val            = float(state.get("best_val", float("inf")))
             patience            = int(state.get("patience", 0))
@@ -761,12 +801,16 @@ def main_worker(rank, world_size):
                     keep_history=False, save_best=False
                 )
 
-        # Unfreeze everything after warmup
-        for p in model_ddp.parameters():
-            p.requires_grad_(True)
+        # # Unfreeze everything after warmup
+        # for p in model_ddp.parameters():
+        #     p.requires_grad_(True)
+        # Do NOT globally re-enable grads. We'll unfreeze the backbone
+        # in-epoch via freeze_backbone(..., False), and keep tv_proj frozen.
 
         for ep in range(start_epoch, EPOCHS + 1):
             print(f"\n[Rank {rank}] Starting Epoch {ep}/{EPOCHS}")
+            # Keep all ranks in lock-step at the epoch boundary
+            if dist.is_available() and dist.is_initialized(): dist.barrier()
             train_sampler.set_epoch(ep)
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(dev)
@@ -834,12 +878,26 @@ def main_worker(rank, world_size):
                         + λ_div * div_loss
                         + reg_term + loss_tv + loss_area + loss_com)
 
-                loss.backward()
-                if step % ACC_STEPS == 0 or step == len(train_dl):
+                # Backward with correct DDP grad-accumulation semantics:
+                # only sync on the final micro-step of each accumulation window
+                sync_now = (step % ACC_STEPS == 0) or (step == len(train_dl))
+                with (model_ddp.no_sync() if not sync_now else nullcontext()):
+                    loss.backward()
+                if sync_now:
                     torch.nn.utils.clip_grad_norm_(model_ddp.parameters(), clip_norm_cur)
                     opt.step()
                     # (we rely on squashing; no hard clamp here)
                     opt.zero_grad(set_to_none=True)
+                     # --- Debug: surface any grad-enabled params that didn't receive grads this step (rank 0 only)
+                    if rank == 0:
+                        missing = []
+                        for n, p in model_ddp.module.named_parameters():
+                            if p.requires_grad and p.grad is None:
+                                missing.append(n)
+                        if missing:
+                            # print only a handful to avoid log spam
+                            head = ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")
+                            print(f"[DDP][debug] {len(missing)} grad-enabled params had no grad on this sync: {head}")
 
                 run += loss.item() * img.size(0)
                 tot += img.size(0)
@@ -923,7 +981,7 @@ def main_worker(rank, world_size):
             # -------------- Rank 0 logging/metrics --------------
             if rank == 0:
                 try:
-                    run_visualization_and_timing(model=model_ddp.module, device=dev, test_dl=test_dl)
+                    # run_visualization_and_timing(model=model_ddp.module, device=dev, test_dl=test_dl)
                     if (ep % 5) == 0:
                         save_epoch_pair_figure(ep, model_ddp, dev, train_dataset, test_dataset)
                 except Exception as e:
@@ -1014,6 +1072,9 @@ def main_worker(rank, world_size):
                     keep_history=False,
                     save_best=improved
                 )
+                # Synchronize after rank-0 I/O (ckpt, logging, optional viz)
+                if dist.is_available() and dist.is_initialized(): dist.barrier()
+                
 
                 # --- Early stopping decision (rank 0 decides, broadcast to all) ---
                 if rank == 0 and patience >= PATIENCE_MAX:
@@ -1104,8 +1165,16 @@ def run_fallback_training(dev):
         print(f"[resume] loading {CKPT_FILE.name}")
         state = torch.load(CKPT_FILE, map_location=dev)
         model_to.load_state_dict(state["model"])
-        opt.load_state_dict(state["opt"])
-        scheduler.load_state_dict(state["sched"])
+        # Optimizer/scheduler load with graceful fallback
+        try:
+            opt.load_state_dict(state["opt"])
+        except Exception as e:
+            print(f"[resume] skipping optimizer state: {e}")
+            _reset_opt_hparams(opt)
+        try:
+            scheduler.load_state_dict(state["sched"])
+        except Exception as e:
+            print(f"[resume] skipping scheduler state: {e}")
         start_epoch         = int(state.get("epoch", 0)) + 1
         best_val            = float(state.get("best_val", float("inf")))
         patience            = int(state.get("patience", 0))
@@ -1169,7 +1238,7 @@ def run_fallback_training(dev):
         )
 
     # Unfreeze all
-    for p in model_to.parameters(): p.requires_grad_(True)
+    # for p in model_to.parameters(): p.requires_grad_(True)
 
     for ep in range(start_epoch, EPOCHS + 1):
         if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats(dev)
@@ -1330,7 +1399,7 @@ def main():
             GRefDataset(test_subset, IMG_DIR, IMG_SIZE),
             batch_size=PER_RANK_BATCH, shuffle=False, num_workers=0, pin_memory=True
         )
-        run_visualization_and_timing(model=model_to.to(dev).eval(), device=dev, test_dl=test_dl)
+        # run_visualization_and_timing(model=model_to.to(dev).eval(), device=dev, test_dl=test_dl)
 
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
@@ -1426,5 +1495,5 @@ if __name__ == "__main__":
             GRefDataset(test_subset, IMG_DIR, IMG_SIZE),
             batch_size=PER_RANK_BATCH, shuffle=False, num_workers=0, pin_memory=True
         )
-        run_visualization_and_timing(model=model_to, device=dev_eval, test_dl=test_dl_eval)
-        print("Post-run evaluation visualizations complete.")
+        # run_visualization_and_timing(model=model_to, device=dev_eval, test_dl=test_dl_eval)
+        # print("Post-run evaluation visualizations complete.")
