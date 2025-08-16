@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:h100:4
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --mem=256G
 #SBATCH --time=4-00:00:00
 #SBATCH --output=ddp_%j_practice.out
 #SBATCH --error=logs/%x_%j_practice.err
