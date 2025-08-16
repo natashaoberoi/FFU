@@ -35,16 +35,13 @@ np.random.seed(42)
 torch.manual_seed(42)
 
 # Local site-packages path(s)
-sys.path.insert(0, "/scratch/zt1/project/msml612/user/noberoi1/my_site_packages")
+sys.path.insert(0, "/scratch/zt1/project/msml612/user/indro/my_site_packages")
 
 # Project imports
 from FFU import UTransformer, coco_name   # (we define GRefDataset locally)
 
-# Tokenizers
-from transformers import AutoTokenizer
-
 # CLIP (local installation)
-sys.path.insert(0, '/scratch/zt1/project/msml612/user/noberoi1/open_clip_package')
+sys.path.insert(0, '/scratch/zt1/project/msml612/user/indro/open_clip_package')
 import open_clip
 
 # ---------------------------------------------------------------------
@@ -54,27 +51,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # OpenCLIP model/tokenizer (tokenizer used in probes; model kept for consistency)
 clip_model, _, _ = open_clip.create_model_and_transforms(
     'ViT-B-32',
-    pretrained='/scratch/zt1/project/msml612/user/noberoi1/open_clip/models--laion--CLIP-ViT-B-32-laion2B-s34B-b79K/open_clip_pytorch_model.bin',
-    cache_dir='/scratch/zt1/project/msml612/user/noberoi1/open_clip'
+    pretrained='/scratch/zt1/project/msml612/user/indro/open_clip/models--laion--CLIP-ViT-B-32-laion2B-s34B-b79K/open_clip_pytorch_model.bin',
+    cache_dir='/scratch/zt1/project/msml612/user/indro/open_clip'
 )
 clip_model = clip_model.eval().to(device)
 clip_tok = open_clip.get_tokenizer(
     'ViT-B-32',  # match the model arch (no slash)
-    cache_dir='/scratch/zt1/project/msml612/user/noberoi1/open_clip'
-)
-
-# HuggingFace tokenizer (for your dataset captions to ids)
-tok = AutoTokenizer.from_pretrained(
-    "bert-base-uncased",
-    cache_dir="/scratch/zt1/project/msml612/user/noberoi1/hf_cache"
+    cache_dir='/scratch/zt1/project/msml612/user/indro/open_clip'
 )
 
 # Paths
-CKPT_DIR   = Path("/scratch/zt1/project/msml612/user/noberoi1/checkpoints")
+CKPT_DIR   = Path("/scratch/zt1/project/msml612/user/indro/checkpoints")
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 CKPT_FILE  = CKPT_DIR / "latest.pt"
 
-ROOT       = '/scratch/zt1/project/msml612/user/noberoi1/datasets'
+ROOT       = '/scratch/zt1/project/msml612/user/indro/datasets'
 GREF_JSON  = f'{ROOT}/grefs(unc).json'
 INST_JSON  = f'{ROOT}/instances.json'
 IMG_DIR    = f'{ROOT}/coco/train2014/gref_images'
@@ -86,12 +77,20 @@ IMG_SIZE   = 512
 MAX_TOK    = 20
 
 # Sampling / splits
-ROWS_TOTAL   = 10_000
+ROWS_TOTAL   = 100
 TRAIN_RATIO  = 0.9
+
+# Note: TRAIN_RATIO is ignored when USE_FULL_DATASET is enabled; we use the
+# dataset-defined train/test splits in full.
+
+# Flag: use full dataset
+USE_FULL_DATASET = True
 
 # Batch & accumulation
 PER_RANK_BATCH = 16          # per-GPU mini-batch
 ACC_STEPS      = 2
+# Run the caption-shuffle probe (full test set, non-sharded) every N epochs
+SHUFFLE_PROBE_EVERY = 5
 
 # LRs (tuned)
 LR_IMG   = 8.24757533344303e-05
@@ -125,9 +124,11 @@ CLIP_NORM_AFTER_UNFREEZE = 0.5
 SIGMA_TOL_FOR_TXT_LR     = 20.0
 
 # Scheduler / early stop
-EPOCHS        = 5
+EPOCHS        = 100
 PATIENCE_MAX  = 15
 min_delta     = 1e-4
+
+WARMUP_EPOCHS = 2
 
 # λ-div schedule
 def lambda_div(ep: int, start: float = 0.0, full: float = 1.0, warmup: int = DIV_WARMUP_EPOCHS):
@@ -136,7 +137,7 @@ def lambda_div(ep: int, start: float = 0.0, full: float = 1.0, warmup: int = DIV
 # Logging CSV
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_id = uuid.uuid4().hex[:8]
-BASE_PATH = "/scratch/zt1/project/msml612/user/noberoi1/"
+BASE_PATH = "/scratch/zt1/project/msml612/user/indro/"
 LOG_DIR = os.path.join(BASE_PATH, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_CSV_PATH = os.path.join(LOG_DIR, f"training_log_{timestamp}_{run_id}.csv")
@@ -149,14 +150,14 @@ def init_log_csv():
                 "epoch","log_gain","xattn_H",
                 "enc_γμ","enc_γσ","enc_βμ","enc_βσ",
                 "dec_γμ","dec_γσ","dec_βμ","dec_βσ",
-                "train_loss","val_loss","lambda_div",
+                "train_loss","combo_train","val_loss","lambda_div",
                 "train_time","val_time","peak_gpu_mem_mb"
             ])
 
 def log_metrics(epoch, log_gain, xattn_H,
                 enc_γμ, enc_γσ, enc_βμ, enc_βσ,
                 dec_γμ, dec_γσ, dec_βμ, dec_βσ,
-                train_loss, val_loss, lambda_div,
+                train_loss, combo_train, val_loss, lambda_div,
                 train_time, val_time, peak_gpu_mem_mb):
     with open(LOG_CSV_PATH, "a", newline="") as f:
         writer = csv.writer(f)
@@ -164,20 +165,83 @@ def log_metrics(epoch, log_gain, xattn_H,
             epoch, log_gain, xattn_H,
             enc_γμ, enc_γσ, enc_βμ, enc_βσ,
             dec_γμ, dec_γσ, dec_βμ, dec_βσ,
-            train_loss, val_loss, lambda_div,
+            train_loss, combo_train, val_loss, lambda_div,
             train_time, val_time, peak_gpu_mem_mb
         ])
+
+# ──────────────────────────────
+# Per-epoch 2×2 visualization
+# ──────────────────────────────
+EPOCH_VIZ_DIR = Path("artifacts/epoch_viz")
+EPOCH_VIZ_DIR.mkdir(parents=True, exist_ok=True)
+# fixed samples so the *same* pair is visualized over time
+VIS_TRAIN_IDX = 0
+VIS_TEST_IDX  = 0
+
+def _get_sample(dataset, idx, device):
+    """dataset -> (img[1,C,H,W], ids[1,77], gt[1,1,H,W], caption:str, img_id:int)."""
+    img, clip_ids, gt, cap, img_id, _sid = dataset[idx]
+    return (img.unsqueeze(0).to(device),
+            clip_ids.unsqueeze(0).to(device),
+            gt.unsqueeze(0).to(device),
+            cap, int(img_id))
+
+def save_epoch_pair_figure(epoch: int, model_any, device, train_dataset, test_dataset):
+    """Save 2×2: Train(GT/Pred), Test(GT/Pred). Print per-sample timings to stdout."""
+    model = model_any.module if hasattr(model_any, "module") else model_any
+    model.eval()
+    with torch.no_grad():
+        # Train sample (timed)
+        t_img, t_ids, t_gt, t_cap, t_iid = _get_sample(train_dataset, VIS_TRAIN_IDX, device)
+        if device.type == "cuda": torch.cuda.synchronize(device)
+        _t0 = time.perf_counter()
+        t_out = model(t_img, t_ids)     # model returns prob in shape [1,1,H,W]
+        if device.type == "cuda": torch.cuda.synchronize(device)
+        t_ms = (time.perf_counter() - _t0) * 1000.0
+        # Ensure 2D arrays: [H,W]
+        t_prob = t_out.squeeze().detach().cpu().numpy()         # [H,W]
+        t_gt_np = t_gt.squeeze().detach().cpu().numpy()         # [H,W]
+        t_base = (t_img.squeeze(0).detach().cpu().permute(1,2,0).numpy() * 255).astype(np.uint8)
+        t_pred = (t_prob > 0.5).astype(np.uint8)
+
+        # Test sample (timed)
+        v_img, v_ids, v_gt, v_cap, v_iid = _get_sample(test_dataset, VIS_TEST_IDX, device)
+        if device.type == "cuda": torch.cuda.synchronize(device)
+        _s0 = time.perf_counter()
+        v_out = model(v_img, v_ids)
+        if device.type == "cuda": torch.cuda.synchronize(device)
+        v_ms = (time.perf_counter() - _s0) * 1000.0
+        v_prob = v_out.squeeze().detach().cpu().numpy()         # [H,W]
+        v_gt_np = v_gt.squeeze().detach().cpu().numpy()         # [H,W]
+        v_base = (v_img.squeeze(0).detach().cpu().permute(1,2,0).numpy() * 255).astype(np.uint8)
+        v_pred = (v_prob > 0.5).astype(np.uint8)
+
+    # Print timings to stdout
+    print(f"[epoch_viz] Epoch {epoch}: train img {t_iid} = {t_ms:.2f} ms | test img {v_iid} = {v_ms:.2f} ms")
+
+    # 2×2 layout (reuse existing overlay_mask)
+    plt.figure(figsize=(10, 8))
+    # Train row
+    plt.subplot(2,2,1); plt.imshow(overlay_mask(t_gt_np, t_base)); plt.axis('off'); plt.title(f"Train GT (img {t_iid})")
+    plt.subplot(2,2,2); plt.imshow(overlay_mask(t_pred,  t_base)); plt.axis('off'); plt.title("Train Pred")
+    # Test row
+    plt.subplot(2,2,3); plt.imshow(overlay_mask(v_gt_np, v_base)); plt.axis('off'); plt.title(f"Test GT (img {v_iid})")
+    plt.subplot(2,2,4); plt.imshow(overlay_mask(v_pred,  v_base)); plt.axis('off'); plt.title("Test Pred")
+    plt.suptitle(f"Train: “{t_cap}”\nTest:  “{v_cap}”", y=0.98)
+    plt.tight_layout()
+    out_path = EPOCH_VIZ_DIR / f"epoch_{epoch:03d}_train{t_iid}_test{v_iid}.png"
+    plt.savefig(out_path.as_posix(), dpi=150); plt.close()
+    print(f"[epoch_viz] saved {out_path.as_posix()}")
+    model.train()
 
 # =====================================================================
 # Dataset prep (and local Dataset class with in-scope ann_ids_to_mask)
 # =====================================================================
 from pycocotools.coco import COCO
 coco = COCO(INST_JSON)
-VOCAB  = len(tok)
 
-def encode_text(t: str):
-    return tok(t, padding="max_length", truncation=True,
-               max_length=MAX_TOK, return_tensors="pt").input_ids[0]
+# CLIP vocabulary size (dynamic from model's token embedding)
+VOCAB  = int(clip_model.token_embedding.weight.shape[0])
 
 def encode_text_clip(txt, ctx_len: int = 77) -> torch.LongTensor:
     """txt: str or list[str] → (B,77) long tensor on CPU."""
@@ -186,6 +250,16 @@ def encode_text_clip(txt, ctx_len: int = 77) -> torch.LongTensor:
         return toks[0]
     else:
         return clip_tok(txt, context_length=ctx_len)
+    
+# --- CLIP-only vocab gating helpers -----------------------------------------
+# Strip CLIP special tokens: pad=0, sos=49406, eos=49407
+CLIP_SPECIAL_TOKENS = {0, 49406, 49407}
+def clip_vocab_ids_from_text(text: str):
+    ids = encode_text_clip(text)  # shape: [77]
+    return [int(t) for t in ids.tolist() if int(t) not in CLIP_SPECIAL_TOKENS]
+def caption_in_clip_vocab(entry, vocab_ids: set[int]) -> bool:
+    return all(set(clip_vocab_ids_from_text(s["sent"])).issubset(vocab_ids)
+               for s in entry["sentences"])
 
 def ann_ids_to_mask(ann_ids, wh):
     """Return the OR-union of all annotation masks."""
@@ -226,7 +300,7 @@ class GRefDataset(Dataset):
         m = ann_ids_to_mask(s["ann_ids"], (W, H))
         m = Image.fromarray(m*255).resize((IMG_SIZE,IMG_SIZE), Image.NEAREST)
         m = torch.from_numpy(np.array(m)//255)[None].float()
-        return img, s["clip_ids"], m, s["text"], s["img_id"]
+        return img, s["clip_ids"], m, s["text"], s["img_id"], idx
 
 # Parse gRef + split (match latest logic)
 with open(GREF_JSON) as f:
@@ -248,25 +322,32 @@ print(f"# Testing Segments = {len(test_entries):,}")
 
 random.shuffle(train_entries)
 random.shuffle(test_entries)
-subset_refs  = train_entries[:ROWS_TOTAL]
-split_idx    = int(len(subset_refs) * TRAIN_RATIO)
-train_subset = subset_refs[:split_idx]
-test_seed    = subset_refs[split_idx:]
 
-train_vocab = set()
+if USE_FULL_DATASET:
+    # Use dataset-defined splits; ignore TRAIN_RATIO entirely.
+    train_subset = train_entries
+    test_seed    = test_entries   # keep name for downstream compatibility
+else:
+    subset_refs  = train_entries[:ROWS_TOTAL]
+    split_idx    = int(len(subset_refs) * TRAIN_RATIO)
+    train_subset = subset_refs[:split_idx]
+    test_seed    = subset_refs[split_idx:]
+
+# Build CLIP token-id vocabulary over TRAIN (no HF/BERT)
+train_vocab_ids = set()
 for e in train_subset:
     for s in e["sentences"]:
-        train_vocab |= set(tok.tokenize(s["sent"].lower()))
+        train_vocab_ids |= set(clip_vocab_ids_from_text(s["sent"]))
 
-def caption_in_vocab(entry, vocab):
-    return all(
-        set(tok.tokenize(s["sent"].lower())).issubset(vocab)
-        for s in entry["sentences"]
-    )
-
-test_subset  = [e for e in test_seed if caption_in_vocab(e, train_vocab)]
-print(f"Final train refs = {len(train_subset):,} (= {len(train_subset)/ROWS_TOTAL:.0%} of {ROWS_TOTAL})")
-print(f"Final test  refs = {len(test_subset):,} (= {len(test_subset)/ROWS_TOTAL:.0%} of {ROWS_TOTAL})")
+if USE_FULL_DATASET:
+    # Use ALL test refs; no vocab-based filtering in full-dataset mode.
+    test_subset = test_entries
+    print(f"Final  train refs = {len(train_subset):,}  (dataset train split)")
+    print(f"Final  test  refs = {len(test_subset):,}  (dataset test split)")
+else:
+    test_subset  = [e for e in test_seed if caption_in_clip_vocab(e, train_vocab_ids)]
+    print(f"Final train refs = {len(train_subset):,} (= {len(train_subset)/ROWS_TOTAL:.0%} of {ROWS_TOTAL})")
+    print(f"Final test  refs = {len(test_subset):,} (= {len(test_subset)/ROWS_TOTAL:.0%} of {ROWS_TOTAL})")
 
 # =====================================================================
 # Model + tv adapter + optim/sched
@@ -298,6 +379,18 @@ def backbone_pool(model: UTransformer, x: torch.Tensor) -> torch.Tensor:
     return feat
 
 # Losses (logits -> sigmoid inside for main combo; area/COM expect probs)
+
+# ---------------------------------------------------------------------
+# Visualization helpers shared by all viz functions
+def overlay_mask(mask: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    """
+    Overlay a binary mask (HxW, {0,1}) onto an RGB image (HxWx3) with a red tint.
+    """
+    out = rgb.copy()
+    sel = (mask.astype(np.uint8) > 0)
+    out[sel] = (0.6 * out[sel] + np.array([255, 0, 0]) * 0.4).astype(np.uint8)
+    return out
+
 def dice_loss(logits, gt, eps=1e-6):
     p = torch.sigmoid(logits.float()); gt = gt.float()
     inter  = (p*gt).sum((2,3))
@@ -379,7 +472,7 @@ def freeze_backbone(m, flag=True):
 
 # Histories
 hist = _dd(list)
-loss_history = {"train": [], "val": [], "shuffle": []}
+loss_history = {"train": [], "val": [], "shuffle": [], "combo": []}
 
 # Probe helper
 def _probe_gamma_beta(clip_tok_batch: torch.Tensor):
@@ -402,6 +495,8 @@ def save_checkpoint(
     extra_unfrozen: bool,
     hist_obj,
     loss_hist_obj,
+    warmup_done: bool = None,
+    warmup_epochs_completed: int = None,
     keep_history: bool = False,
     save_best: bool = False,
     ckpt_file=CKPT_FILE,
@@ -418,6 +513,10 @@ def save_checkpoint(
         "hist"           : hist_obj,
         "loss_history"   : loss_hist_obj,
     }
+    if warmup_done is not None:
+        state["warmup_done"] = bool(warmup_done)
+    if warmup_epochs_completed is not None:
+        state["warmup_epochs_completed"] = int(warmup_epochs_completed)
     torch.save(state, ckpt_file)
     if save_best:
         torch.save(state, ckpt_dir / "best.pt")
@@ -444,7 +543,7 @@ def run_visualization_and_timing(model, device, test_dl):
     preds, gts, caps, bases = {}, {}, {}, {}
     inf_times = []
     with torch.no_grad():
-        for img, ids, gt, cap, img_id in test_dl:
+        for img, ids, gt, cap, img_id, _sid in test_dl:
             img, ids = img.to(device), ids.to(device)
 
             if device.type == "cuda":
@@ -477,10 +576,6 @@ def run_visualization_and_timing(model, device, test_dl):
     avg_ms = np.mean(inf_times); std_ms = np.std(inf_times)
     print(f"\n Average Forward-Pass Time  : {avg_ms:6.2f} ms / image (± {std_ms:4.2f} ms  •  {len(inf_times)} images)")
 
-    def overlay_mask(mask, rgb):
-        o = rgb.copy()
-        o[mask == 1] = (0.6 * o[mask == 1] + np.array([255, 0, 0]) * 0.4).astype(np.uint8)
-        return o
 
     for iid in preds:
         base = bases[iid]
@@ -504,7 +599,7 @@ def run_visualization_and_timing(model, device, test_dl):
 # DDP worker
 def main_worker(rank, world_size):
     try:
-        print(f"[Rank {rank}] Starting Process")
+        if rank == 0: print("[DDP] Starting processes …")
         setup_ddp(rank, world_size)
         dev = torch.device(f'cuda:{rank}')
         torch.cuda.set_device(rank)
@@ -514,19 +609,22 @@ def main_worker(rank, world_size):
         model_to.to(dev)
         model_ddp = DDP(model_to, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
-        # Build distributed data
+        # Build datasets (keep handles for DDP caption-shuffle)
+        train_dataset = GRefDataset(train_subset, IMG_DIR, IMG_SIZE)
+        test_dataset  = GRefDataset(test_subset,  IMG_DIR, IMG_SIZE)
+
         train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank, shuffle=True)
         test_sampler  = DistributedSampler(test_subset,  num_replicas=world_size, rank=rank, shuffle=False)
 
         train_dl = DataLoader(
-            GRefDataset(train_subset, IMG_DIR, IMG_SIZE),
+            train_dataset,
             batch_size=PER_RANK_BATCH,
             sampler=train_sampler,
             num_workers=0,
             pin_memory=True
         )
         test_dl = DataLoader(
-            GRefDataset(test_subset, IMG_DIR, IMG_SIZE),
+            test_dataset,
             batch_size=PER_RANK_BATCH,
             sampler=test_sampler,
             num_workers=0,
@@ -559,6 +657,8 @@ def main_worker(rank, world_size):
         best_val = float("inf")
         patience = 0
         extra_clip_unfrozen = False
+        warmup_done = False
+        warmup_epochs_completed = 0
 
         # Optional resume (rank 0 loads; then broadcast)
         if rank == 0 and CKPT_FILE.exists():
@@ -571,6 +671,8 @@ def main_worker(rank, world_size):
             best_val            = float(state.get("best_val", float("inf")))
             patience            = int(state.get("patience", 0))
             extra_clip_unfrozen = bool(state.get("extra_unfrozen", False))
+            warmup_done         = bool(state.get("warmup_done", False))
+            warmup_epochs_completed = int(state.get("warmup_epochs_completed", 0))
             try:
                 for k,v in state.get("hist", {}).items(): hist[k] = v
                 for k,v in state.get("loss_history", {}).items(): loss_history[k] = v
@@ -583,14 +685,20 @@ def main_worker(rank, world_size):
         best_val_t = torch.tensor(best_val,   device=dev, dtype=torch.float32)
         patience_t = torch.tensor(patience,   device=dev, dtype=torch.long)
         unfrozen_t = torch.tensor(1 if extra_clip_unfrozen else 0, device=dev, dtype=torch.long)
+        wdone_t    = torch.tensor(1 if warmup_done else 0, device=dev, dtype=torch.long)
+        wcomp_t    = torch.tensor(warmup_epochs_completed, device=dev, dtype=torch.long)
         dist.broadcast(start_ep_t, src=0)
         dist.broadcast(best_val_t, src=0)
         dist.broadcast(patience_t, src=0)
         dist.broadcast(unfrozen_t, src=0)
+        dist.broadcast(wdone_t, src=0)
+        dist.broadcast(wcomp_t, src=0)
         start_epoch = int(start_ep_t.item())
         best_val    = float(best_val_t.item())
         patience    = int(patience_t.item())
         extra_clip_unfrozen = bool(unfrozen_t.item())
+        warmup_done = bool(wdone_t.item())
+        warmup_epochs_completed = int(wcomp_t.item())
 
         # Initial freeze policy (text tower frozen; last 2 blocks unfrozen)
         for p in model_ddp.module.film.clip.parameters():
@@ -599,39 +707,59 @@ def main_worker(rank, world_size):
             for p in blk.parameters():
                 p.requires_grad_(True)
 
-        # Warmup: text-only cosine sim, backbone frozen; set vision LR=0
+        # Warmup (resumable): text-only cosine sim, backbone frozen; vision LR=0
         freeze_backbone(model_ddp.module, True)
         for p in model_ddp.module.film.parameters():
             p.requires_grad_(True)
 
         vis_group, text_group, gain_group = opt.param_groups
-        orig_lr_vis, vis_group["lr"] = vis_group["lr"], 0.0
+        orig_lr_vis = vis_group["lr"]
+        if not warmup_done:
+            vis_group["lr"] = 0.0
 
         if rank == 0: init_log_csv()
 
-        WARMUP_EPOCHS = 2
-        for warm_ep in range(WARMUP_EPOCHS):
-            model_ddp.train()
-            train_sampler.set_epoch(warm_ep)
-            cum_loss = n = 0
-            pbar_w = tqdm(train_dl, desc=f"[Rank {rank}] warm-up {warm_ep+1}/2", leave=False)
-            for img, clip_ids, *_ in pbar_w:
-                img, clip_ids = img.to(dev), clip_ids.to(dev)
-                with torch.no_grad():
-                    vis_feat = backbone_pool(model_ddp.module, img)  # (B, C3)
-                    vis_feat = model_ddp.module.tv_proj(vis_feat)    # (B, 512)
-                txt_feat = model_ddp.module.film.clip.encode_text(clip_ids)
-                loss = contrastive_tv_loss(vis_feat, txt_feat)
-                loss.backward()
-                opt.step(); opt.zero_grad()
-                cum_loss += loss.item() * img.size(0); n += img.size(0)
-                pbar_w.set_postfix(loss=f"{loss.item():.3f}")
+        
+        # Resume-aware warmup loop
+        if not warmup_done:
+            for warm_ep in range(warmup_epochs_completed, WARMUP_EPOCHS):
+                model_ddp.train()
+                train_sampler.set_epoch(warm_ep)
+                cum_loss = n = 0
+                pbar_w = tqdm(train_dl, desc=f"[Rank {rank}] warm-up {warm_ep+1}/{WARMUP_EPOCHS}", leave=False)
+                for img, clip_ids, *_ in pbar_w:
+                    img, clip_ids = img.to(dev), clip_ids.to(dev)
+                    with torch.no_grad():
+                        vis_feat = backbone_pool(model_ddp.module, img)  # (B, C3)
+                        vis_feat = model_ddp.module.tv_proj(vis_feat)    # (B, 512)
+                    txt_feat = model_ddp.module.film.clip.encode_text(clip_ids)
+                    loss = contrastive_tv_loss(vis_feat, txt_feat)
+                    loss.backward()
+                    opt.step(); opt.zero_grad()
+                    cum_loss += loss.item() * img.size(0); n += img.size(0)
+                    pbar_w.set_postfix(loss=f"{loss.item():.3f}")
+                # update warmup progress and checkpoint (rank0)
+                warmup_epochs_completed = warm_ep + 1
+                if rank == 0:
+                    print(f"  Warm-Up Epoch {warm_ep+1}: Loss {cum_loss/n:.4f}")
+                    save_checkpoint(
+                        ep=0, model=model_ddp.module, opt=opt, scheduler=scheduler,
+                        best_val=best_val, patience=patience, extra_unfrozen=extra_clip_unfrozen,
+                        hist_obj=hist, loss_hist_obj=loss_history,
+                        warmup_done=False, warmup_epochs_completed=warmup_epochs_completed,
+                        keep_history=False, save_best=False
+                    )
+            warmup_done = True
+            vis_group["lr"] = orig_lr_vis
             if rank == 0:
-                print(f"  Warm-Up Epoch {warm_ep+1}: Loss {cum_loss/n:.4f}")
-
-        vis_group["lr"] = orig_lr_vis
-        if rank == 0:
-            print(f"Warm-Up Done: Backbone frozen for next {FREEZE_EPOCHS} epochs")
+                print(f"Warm-Up Done: Backbone frozen for next {FREEZE_EPOCHS} epochs")
+                save_checkpoint(
+                    ep=0, model=model_ddp.module, opt=opt, scheduler=scheduler,
+                    best_val=best_val, patience=patience, extra_unfrozen=extra_clip_unfrozen,
+                    hist_obj=hist, loss_hist_obj=loss_history,
+                    warmup_done=True, warmup_epochs_completed=warmup_epochs_completed,
+                    keep_history=False, save_best=False
+                )
 
         # Unfreeze everything after warmup
         for p in model_ddp.parameters():
@@ -659,25 +787,12 @@ def main_worker(rank, world_size):
 
             λ_div = lambda_div(ep)
 
-            # Probe freeze/thaw
-            if ep == TEXT_PROBE_FREEZE_EPOCH:
-                for n, p in model_ddp.named_parameters():
-                    if ('film' in n) or ('embed' in n):
-                        p.requires_grad_(False)
-                if rank == 0: print(">> PROBE: Text Branch **FROZEN**")
-
-            if ep == TEXT_PROBE_THAW_EPOCH:
-                for n, p in model_ddp.named_parameters():
-                    if ('film' in n) or ('embed' in n):
-                        p.requires_grad_(True)
-                if rank == 0: print(">> PROBE: Text Branch **UNFROZEN**")
-
             # ------------------ TRAIN ------------------
             model_ddp.train()
             opt.zero_grad(set_to_none=True)
             run, run_main, tot = 0., 0., 0
             pbar = tqdm(train_dl, desc=f"[Rank {rank}] Ep{ep}", leave=False)
-            for step, (img, clip_ids, gt, _, img_id) in enumerate(pbar, 1):
+            for step, (img, clip_ids, gt, _, img_id, _sid) in enumerate(pbar, 1):
                 img, clip_ids, gt = img.to(dev), clip_ids.to(dev), gt.to(dev)
                 prob = model_ddp(img, clip_ids)  # model currently returns prob
                 # turn prob -> logits safely so combo_loss sees logits
@@ -748,7 +863,8 @@ def main_worker(rank, world_size):
             v_sum = torch.tensor(0., device=dev)
             v_n   = torch.tensor(0., device=dev)
             with torch.no_grad():
-                for img, clip_ids, gt, _, img_id in test_dl:
+                pbar_v = tqdm(test_dl, desc=f"[Rank {rank}] Val Ep{ep}", leave=False)
+                for img, clip_ids, gt, _, img_id, _sid in pbar_v:
                     img, clip_ids, gt = img.to(dev), clip_ids.to(dev), gt.to(dev)
                     prob_val = model_ddp(img, clip_ids)
                     eps = 1e-6
@@ -762,6 +878,44 @@ def main_worker(rank, world_size):
             end_val = time.time()
             val_time = end_val - start_val
 
+            # ---------------- CAPTION-SHUFFLE PROBE (every 5 epochs, DDP) -----------
+            shuffle_loss_val = float('nan')
+            if ((ep-1) % SHUFFLE_PROBE_EVERY) == 0:
+                # Build ALL clip token ids on rank 0, then broadcast to peers
+                if rank == 0:
+                    with torch.no_grad():
+                        all_clip_ids = torch.stack(
+                            [test_dataset.samples[i]["clip_ids"] for i in range(len(test_dataset))],
+                            dim=0
+                        ).to(dev)  # [N,77]
+                    perm = torch.randperm(all_clip_ids.size(0), device=dev)
+                else:
+                    # placeholders for broadcast
+                    all_clip_ids = torch.empty((len(test_dataset), 77), dtype=torch.long, device=dev)
+                    perm = torch.empty((len(test_dataset),), dtype=torch.long, device=dev)
+                dist.broadcast(all_clip_ids, src=0)
+                dist.broadcast(perm,         src=0)
+
+                s_sum = torch.tensor(0., device=dev)
+                s_n   = torch.tensor(0., device=dev)
+                eps   = 1e-6
+                with torch.no_grad():
+                    pbar_s = tqdm(test_dl, desc=f"[Rank {rank}] Shuffle Ep{ep}", leave=False)
+                    for img, _, gt, _, _img_id, sid in pbar_s:
+                        img, gt = img.to(dev), gt.to(dev)
+                        sid = sid.to(dev) if torch.is_tensor(sid) else torch.as_tensor(sid, device=dev)
+                        # mismatched captions via global permutation
+                        clip_ids_shuf = all_clip_ids[perm[sid]]
+                        prob_s   = model_ddp(img, clip_ids_shuf)
+                        logits_s = torch.log(prob_s.clamp(eps,1-eps) / (1 - prob_s.clamp(eps,1-eps)))
+                        s_loss   = combo_loss(logits_s, gt)
+                        s_sum   += s_loss * img.size(0)
+                        s_n     += img.size(0)
+                # global average over ranks
+                dist.all_reduce(s_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(s_n,   op=dist.ReduceOp.SUM)
+                shuffle_loss_val = (s_sum / s_n).item()
+
             local_max_mem = torch.tensor(torch.cuda.max_memory_allocated(dev), device=dev)
             dist.all_reduce(local_max_mem, op=dist.ReduceOp.MAX)
             max_mem_mb = local_max_mem.item() / 1024**2
@@ -770,6 +924,8 @@ def main_worker(rank, world_size):
             if rank == 0:
                 try:
                     run_visualization_and_timing(model=model_ddp.module, device=dev, test_dl=test_dl)
+                    if (ep % 5) == 0:
+                        save_epoch_pair_figure(ep, model_ddp, dev, train_dataset, test_dataset)
                 except Exception as e:
                     print(f"[Rank 0] Visualization Failed: {e}")
 
@@ -807,7 +963,8 @@ def main_worker(rank, world_size):
                 # Loss history for post-run plots
                 loss_history["train"].append(train_loss)
                 loss_history["val"].append(val_loss)
-                loss_history["shuffle"].append(float('nan'))  # not computed in DDP loop
+                loss_history["shuffle"].append(shuffle_loss_val)
+                loss_history["combo"].append(combo_train)
 
                 # CSV
                 log_metrics(
@@ -822,7 +979,7 @@ def main_worker(rank, world_size):
                     dec_γσ=hist["dec_γσ"][-1] if hist["dec_γσ"] else [],
                     dec_βμ=hist["dec_βμ"][-1] if hist["dec_βμ"] else [],
                     dec_βσ=hist["dec_βσ"][-1] if hist["dec_βσ"] else [],
-                    train_loss=train_loss, val_loss=val_loss,
+                    train_loss=train_loss, combo_train=combo_train, val_loss=val_loss,
                     lambda_div=λ_div,
                     train_time=train_time, val_time=val_time,
                     peak_gpu_mem_mb=max_mem_mb
@@ -852,9 +1009,21 @@ def main_worker(rank, world_size):
                     extra_unfrozen=extra_clip_unfrozen,
                     hist_obj=hist,
                     loss_hist_obj=loss_history,
+                    warmup_done=warmup_done,
+                    warmup_epochs_completed=warmup_epochs_completed,
                     keep_history=False,
                     save_best=improved
                 )
+
+                # --- Early stopping decision (rank 0 decides, broadcast to all) ---
+                if rank == 0 and patience >= PATIENCE_MAX:
+                    print(f"[EarlyStop] No val improvement for {patience} epochs "
+                          f"(≥ PATIENCE_MAX={PATIENCE_MAX}). Stopping.")
+                stop_t = torch.tensor(1 if (rank == 0 and patience >= PATIENCE_MAX) else 0,
+                                      device=dev, dtype=torch.long)
+                dist.broadcast(stop_t, src=0)
+                if stop_t.item() == 1:
+                    break
 
             # Broadcast updated small state so all ranks match decisions
             best_val_t = torch.tensor(best_val, device=dev, dtype=torch.float32)
@@ -929,6 +1098,8 @@ def run_fallback_training(dev):
     best_val = float('inf')
     patience = 0
     extra_clip_unfrozen = False
+    warmup_done = False
+    warmup_epochs_completed = 0
     if CKPT_FILE.exists():
         print(f"[resume] loading {CKPT_FILE.name}")
         state = torch.load(CKPT_FILE, map_location=dev)
@@ -939,6 +1110,8 @@ def run_fallback_training(dev):
         best_val            = float(state.get("best_val", float("inf")))
         patience            = int(state.get("patience", 0))
         extra_clip_unfrozen = bool(state.get("extra_unfrozen", False))
+        warmup_done         = bool(state.get("warmup_done", False))
+        warmup_epochs_completed = int(state.get("warmup_epochs_completed", 0))
         try:
             for k,v in state.get("hist", {}).items(): hist[k] = v
             for k,v in state.get("loss_history", {}).items(): loss_history[k] = v
@@ -955,27 +1128,45 @@ def run_fallback_training(dev):
     freeze_backbone(model_to, True)
     for p in model_to.film.parameters(): p.requires_grad_(True)
     vis_group, text_group, gain_group = opt.param_groups
-    orig_lr_vis,  vis_group["lr"]  = vis_group["lr"],  0.0
+    orig_lr_vis = vis_group["lr"]
+    if not warmup_done:
+        vis_group["lr"]  = 0.0
 
-    print("Running 2-epoch cosine-similarity warm-up …")
-    for warm_ep in range(2):
-        cum_loss = n = 0
-        pbar_w = tqdm(train_dl, desc=f"warm-up {warm_ep+1}/2", leave=False)
-        for img, clip_ids, *_ in pbar_w:
-            img, clip_ids = img.to(dev), clip_ids.to(dev)
-            with torch.no_grad():
-                vis_feat = backbone_pool(model_to, img)
-                vis_feat = model_to.tv_proj(vis_feat)
-            txt_feat = model_to.film.clip.encode_text(clip_ids)
-            loss = contrastive_tv_loss(vis_feat, txt_feat)
-            loss.backward()
-            opt.step(); opt.zero_grad()
-            cum_loss += loss.item() * img.size(0); n += img.size(0)
-            pbar_w.set_postfix(loss=f"{loss.item():.3f}")
-        print(f"  warm-up epoch {warm_ep+1}:  loss {cum_loss/n:.4f}")
-
-    vis_group["lr"]  = orig_lr_vis
-    print(f"Warm-up Done — Backbone will stay frozen for the next {FREEZE_EPOCHS} epochs\n")
+    if not warmup_done:
+        print(f"Running {WARMUP_EPOCHS}-epoch cosine-similarity warm-up … (resume @ {warmup_epochs_completed}/{WARMUP_EPOCHS})")
+        for warm_ep in range(warmup_epochs_completed, WARMUP_EPOCHS):
+            cum_loss = n = 0
+            pbar_w = tqdm(train_dl, desc=f"[Rank 0] WARMUP {warm_ep+1}/{WARMUP_EPOCHS}", leave=False)
+            for img, clip_ids, *_ in pbar_w:
+                img, clip_ids = img.to(dev), clip_ids.to(dev)
+                with torch.no_grad():
+                    vis_feat = backbone_pool(model_to, img)
+                    vis_feat = model_to.tv_proj(vis_feat)
+                txt_feat = model_to.film.clip.encode_text(clip_ids)
+                loss = contrastive_tv_loss(vis_feat, txt_feat)
+                loss.backward()
+                opt.step(); opt.zero_grad()
+                cum_loss += loss.item() * img.size(0); n += img.size(0)
+                pbar_w.set_postfix(loss=f"{loss.item():.3f}")
+            warmup_epochs_completed = warm_ep + 1
+            print(f"  warm-up epoch {warm_ep+1}:  loss {cum_loss/n:.4f}")
+            save_checkpoint(
+                ep=0, model=model_to, opt=opt, scheduler=scheduler,
+                best_val=best_val, patience=patience, extra_unfrozen=extra_clip_unfrozen,
+                hist_obj=hist, loss_hist_obj=loss_history,
+                warmup_done=False, warmup_epochs_completed=warmup_epochs_completed,
+                keep_history=False, save_best=False
+            )
+        warmup_done = True
+        vis_group["lr"]  = orig_lr_vis
+        print(f"Warm-up Done — Backbone will stay frozen for the next {FREEZE_EPOCHS} epochs\n")
+        save_checkpoint(
+            ep=0, model=model_to, opt=opt, scheduler=scheduler,
+            best_val=best_val, patience=patience, extra_unfrozen=extra_clip_unfrozen,
+            hist_obj=hist, loss_hist_obj=loss_history,
+            warmup_done=True, warmup_epochs_completed=warmup_epochs_completed,
+            keep_history=False, save_best=False
+        )
 
     # Unfreeze all
     for p in model_to.parameters(): p.requires_grad_(True)
@@ -993,22 +1184,11 @@ def run_fallback_training(dev):
             opt.param_groups[0]["lr"] = LR_IMG
 
         λ_div = lambda_div(ep)
-
-        # Probe freeze/thaw
-        if ep == TEXT_PROBE_FREEZE_EPOCH:
-            for n, p in model_to.named_parameters():
-                if ('film' in n) or ('embed' in n): p.requires_grad_(False)
-            print(">> PROBE: text branch **FROZEN**")
-        if ep == TEXT_PROBE_THAW_EPOCH:
-            for n, p in model_to.named_parameters():
-                if ('film' in n) or ('embed' in n): p.requires_grad_(True)
-            print(">> PROBE: text branch **UNFROZEN**")
-
         # TRAIN
         model_to.train(); run, run_main, tot = 0., 0., 0
         opt.zero_grad(set_to_none=True)
-        pbar = tqdm(train_dl, desc=f"Ep{ep}", leave=False)
-        for step, (img, clip_ids, gt, _, img_id) in enumerate(pbar, 1):
+        pbar = tqdm(train_dl, desc=f"[Rank 0] Ep{ep}", leave=False)
+        for step, (img, clip_ids, gt, _, img_id, _sid) in enumerate(pbar, 1):
             img, clip_ids, gt = img.to(dev), clip_ids.to(dev), gt.to(dev)
             prob = model_to(img, clip_ids)
             eps=1e-6; logits = torch.log(prob.clamp(eps,1-eps)/(1-prob.clamp(eps,1-eps)))
@@ -1062,7 +1242,8 @@ def run_fallback_training(dev):
         start_val = time.time()
         model_to.eval(); v_sum=v_n=0
         with torch.no_grad():
-            for img, clip_ids, gt, _, img_id in test_dl:
+            pbar_v = tqdm(test_dl, desc=f"[Rank 0] Val Ep{ep}", leave=False)
+            for img, clip_ids, gt, _, img_id, _sid in pbar_v:
                 img, clip_ids, gt = img.to(dev), clip_ids.to(dev), gt.to(dev)
                 prob_val = model_to(img, clip_ids)
                 eps=1e-6; logits_val = torch.log(prob_val.clamp(eps,1-eps)/(1-prob_val.clamp(eps,1-eps)))
@@ -1123,9 +1304,15 @@ def run_fallback_training(dev):
 
         scheduler.step(val_loss)
 
+        # --- Early stopping in single-GPU fallback ---
+        if patience >= PATIENCE_MAX:
+            print(f"[EarlyStop] No val improvement for {patience} epochs "
+                  f"(≥ PATIENCE_MAX={PATIENCE_MAX}). Stopping.")
+            break
+
 # ---------------------------------------------------------------------
 def main():
-    world_size = 4
+    world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
     try:
         print("Launching DDP training...")
         mp.spawn(main_worker, args=(world_size,), nprocs=world_size, join=True)
@@ -1166,14 +1353,26 @@ if __name__ == "__main__":
         # 1) Loss Curves
         plt.figure(figsize=(6,4))
         plt.plot(epochs, loss_history["train"],   label="train")
+        plt.plot(epochs, loss_history["combo"],   label="combo (train)")
         plt.plot(epochs, loss_history["val"],     label="val")
-        plt.plot(epochs, loss_history["shuffle"], label="caption shuffle")
         plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend(); plt.title("Loss curves")
         plt.tight_layout()
         os.makedirs("artifacts/plots", exist_ok=True)
         out_path = os.path.join("artifacts/plots", f"loss_curve_ep{len(epochs)}.png")
         plt.savefig(out_path, dpi=150)
         plt.close()
+
+        # 1b) Save a separate plot: Shuffle vs Val at probe epochs (1,6,11,…)
+        probe_epochs = [i+1 for i, v in enumerate(loss_history["shuffle"]) if (not math.isnan(v))]
+        if len(probe_epochs) > 0:
+            y_shuffle = [loss_history["shuffle"][e-1] for e in probe_epochs]
+            y_val     = [loss_history["val"][e-1]     for e in probe_epochs]
+            plt.figure(figsize=(6,4))
+            plt.plot(probe_epochs, y_shuffle, marker="o", label="caption shuffle")
+            plt.plot(probe_epochs, y_val,     marker="o", label="val")
+            plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend(); plt.title("Shuffle vs Val (every 5 epochs)")
+            os.makedirs("artifacts/plots", exist_ok=True)
+            plt.tight_layout(); plt.savefig("artifacts/plots/shuffle_vs_val.png", dpi=150); plt.close()
 
         # 2) γ / β evolution
         for s in range(4):
