@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -t 4-00:00:00
+#SBATCH -t 1-00:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:h100:4
@@ -10,7 +10,7 @@
 #SBATCH --mail-type=END
 
 # source activate your_env  # activate your python env
-cd ~/scratch/zt1/project/msml612/user/indro/FFU
+# cd ~/scratch/zt1/project/msml612/user/indro/FFU
 
 module purge
 module load python/3.10.10
@@ -20,6 +20,7 @@ pip install --user regex ftfy
 pip install --user torch==2.1.2 torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install --user transformers
 pip install --user pycocotools
+pip install --user z3-solver==4.12.5
 
 # Debug info
 echo "Running on host: $(hostname)"
