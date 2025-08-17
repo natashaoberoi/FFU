@@ -10,7 +10,18 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 
-from torch import amp
+#
+# ---- torch.compile / Z3 gating ---------------------------------------------
+# Default: do NOT compile (set USE_TORCH_COMPILE=1 to try enabling it).
+USE_TORCH_COMPILE = os.getenv("USE_TORCH_COMPILE", "0") == "1"
+try:
+    import z3  # noqa: F401
+    _HAVE_Z3 = True
+except Exception:
+    _HAVE_Z3 = False
+# ----------------------------------------------------------------------------
+
+# from torch import amp
 from PIL import Image
 from tqdm.auto import tqdm
 from collections import defaultdict as _dd
@@ -23,6 +34,32 @@ from contextlib import nullcontext
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# --- AMP compatibility shim -----------------------------------------------
+# Supports both older torch.cuda.amp and newer torch.amp APIs.
+try:
+    import torch as _torch
+    if hasattr(_torch, "amp") and hasattr(_torch.amp, "autocast") and hasattr(_torch.amp, "GradScaler"):
+        # New-style API (PyTorch >= 2.0)
+        def _autocast_impl(dtype=None):
+            return _torch.amp.autocast(device_type="cuda", dtype=dtype)
+        GradScaler = _torch.amp.GradScaler
+    else:
+        raise ImportError
+except Exception:
+    # Fallback to classic CUDA AMP (PyTorch 1.x)
+    from torch.cuda.amp import autocast as _autocast_impl
+    from torch.cuda.amp import GradScaler  # noqa: F401
+
+# --- AMP knobs (global) -----------------------------------------------------
+# Enable AMP; prefer bf16 when supported (can override via env USE_BF16=0/1)
+USE_AMP = True
+try:
+    _env_bf16 = os.getenv("USE_BF16", "1")
+    USE_BF16 = (_env_bf16 == "1") and torch.cuda.is_available() and \
+               hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+except Exception:
+    USE_BF16 = False
+
 # ---------------------------------------------------------------------
 # DDP env defaults for mp.spawn + init_method='env://'
 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -30,6 +67,28 @@ os.environ.setdefault("MASTER_PORT", "29500")
 os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
 os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")  # fail fast on collectives
 torch.backends.cudnn.benchmark = True
+# Reduce allocator fragmentation so we don't request huge contiguous blocks
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
+
+# Avoid /dev/shm mmaps in DataLoader IPC (prevents "unable to mmap ... Cannot allocate memory (12)")
+try:
+    mp.set_sharing_strategy("file_system")
+except Exception as _e:
+    print(f"[warn] set_sharing_strategy(file_system) failed: {_e}")
+
+# Speed knobs (safe defaults)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try: torch.set_float32_matmul_precision("high")
+except Exception: pass
+# Dataloader tuning — hard-disable multiprocessing by default to avoid /dev/shm mmap failures
+NUM_WORKERS_DEFAULT = 0
+NUM_WORKERS         = int(os.getenv("NUM_WORKERS", NUM_WORKERS_DEFAULT))  # override per job if you want
+PREFETCH_FACTOR_DEFAULT = 2
+PREFETCH_FACTOR     = int(os.getenv("PREFETCH_FACTOR", PREFETCH_FACTOR_DEFAULT))
+PERSISTENT_WORKERS  = False
+USE_CHANNELS_LAST   = True
+# USE_AMP            = True  # bf16 if supported, else fp16
 # ---------------------------------------------------------------------
 
 # Repro
@@ -90,7 +149,7 @@ TRAIN_RATIO  = 0.9
 USE_FULL_DATASET = True
 
 # Batch & accumulation
-PER_RANK_BATCH = 32          # per-GPU mini-batch
+PER_RANK_BATCH = 8          # per-GPU mini-batch
 ACC_STEPS      = 2
 # Run the caption-shuffle probe (full test set, non-sharded) every N epochs
 SHUFFLE_PROBE_EVERY = 5
@@ -314,9 +373,13 @@ class GRefDataset(Dataset):
         return self._wh_cache[iid]
     def __getitem__(self, idx):
         s = self.samples[idx]
-        img = Image.open(s["path"]).convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
+        # single open for resize; get W,H from cache (avoid second PIL open)
+        img_pil = Image.open(s["path"]).convert("RGB")
+        W, H = self._wh(s["img_id"], s["path"])
+        img = img_pil.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
         img = torch.from_numpy(np.array(img)).permute(2,0,1).float()/255.
-        W, H = Image.open(s["path"]).size
+        # if USE_CHANNELS_LAST:
+        #     img = img.contiguous(memory_format=torch.channels_last)
         m = ann_ids_to_mask(s["ann_ids"], (W, H))
         m = Image.fromarray(m*255).resize((IMG_SIZE,IMG_SIZE), Image.NEAREST)
         m = torch.from_numpy(np.array(m)//255)[None].float()
@@ -526,9 +589,12 @@ def save_checkpoint(
     ckpt_file=CKPT_FILE,
     ckpt_dir=CKPT_DIR
 ):
+    # Always save the *base* model (strip DDP/compile wrappers if present)
+    _m = getattr(model, "module", model)
+    _m = getattr(_m, "_orig_mod", _m)
     state = {
         "epoch"          : ep,
-        "model"          : model.state_dict(),
+        "model"          : _m.state_dict(),
         "opt"            : opt.state_dict(),
         "sched"          : scheduler.state_dict(),
         "best_val"       : best_val,
@@ -575,7 +641,7 @@ def run_visualization_and_timing(model, device, test_dl):
                 t0 = torch.cuda.Event(enable_timing=True)
                 t1 = torch.cuda.Event(enable_timing=True)
                 t0.record()
-                with amp.autocast('cuda', dtype=torch.float16):
+                with _autocast_impl(dtype=(torch.bfloat16 if (USE_AMP and USE_BF16) else torch.float16)):
                     prob_batch = model(img, ids)   # model currently returns prob
                 t1.record()
                 torch.cuda.synchronize()
@@ -625,10 +691,34 @@ def main_worker(rank, world_size):
         torch.cuda.set_device(rank)
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
 
-        # Model to device and wrap DDP
-        model_to.to(dev)
-        # Re-enable unused-param detection to avoid reducer stalls if any param doesn't get grad
-        model_ddp = DDP(model_to, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+        # Model to device (use local handle; don't shadow global `model_to`)
+        core_model = model_to
+        core_model.to(dev)
+        if USE_CHANNELS_LAST:
+            core_model.to(memory_format=torch.channels_last)
+        # (optional) torch.compile — only if explicitly requested AND Z3 is ok
+        if USE_TORCH_COMPILE and _HAVE_Z3:
+            try:
+                import torch._dynamo as dynamo
+                # be permissive: if backend errors, fall back to eager
+                dynamo.config.suppress_errors = True
+                dynamo.config.verify_correctness = False
+            except Exception:
+                pass
+            try:
+                core_model = torch.compile(core_model, mode="reduce-overhead")
+            except Exception as e:
+                if rank == 0: print(f"[compile] disabled: {e}")
+        elif USE_TORCH_COMPILE and not _HAVE_Z3 and rank == 0:
+            print("[compile] disabled: Z3 not available on this node; run with USE_TORCH_COMPILE=0 or install z3-solver.")
+        # DDP: enable unused-param detection and reuse grad bucket storage to cut peak memory
+        model_ddp = DDP(
+            core_model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True
+        )
 
         # Build datasets (keep handles for DDP caption-shuffle)
         train_dataset = GRefDataset(train_subset, IMG_DIR, IMG_SIZE)
@@ -638,23 +728,46 @@ def main_worker(rank, world_size):
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank,
                                           shuffle=True, drop_last=True)
         test_sampler  = DistributedSampler(test_dataset,  num_replicas=world_size, rank=rank, shuffle=False)
- 
 
-        train_dl = DataLoader(
-            train_dataset,
-            batch_size=PER_RANK_BATCH,
-            sampler=train_sampler,
-            num_workers=0,
-            pin_memory=True,
-            drop_last=True    # ensure every rank runs the same number of optimizer steps
-         )
-        test_dl = DataLoader(
-            test_dataset,
-            batch_size=PER_RANK_BATCH,
-            sampler=test_sampler,
-            num_workers=0,
-            pin_memory=True
-        )
+        # Helper that builds a DataLoader and falls back to workers=0 on mmap/SHM errors
+        def _safe_make_dataloader(dataset, sampler, batch_size, drop_last):
+            # Only pass MP-only kwargs when workers>0; with workers==0, avoid them entirely.
+            dl_kwargs = dict(num_workers=NUM_WORKERS, pin_memory=True)
+            if NUM_WORKERS > 0:
+                dl_kwargs.update(
+                    persistent_workers=PERSISTENT_WORKERS,
+                    prefetch_factor=PREFETCH_FACTOR,
+                )
+                try:
+                    dl_kwargs["multiprocessing_context"] = mp.get_context("spawn")
+                except Exception:
+                    pass  # older torch
+            try:
+                dl_kwargs["pin_memory_device"] = f"cuda:{rank}"
+            except TypeError:
+                pass  # older PyTorch
+            try:
+                return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                                  drop_last=drop_last, **dl_kwargs)
+            except OSError as e:
+                # e.g., "mmap failed: Cannot allocate memory (12)" when spinning up workers
+                if ("Cannot allocate memory" in str(e)) or ("mmap" in str(e)):
+                    if rank == 0:
+                        print("[DataLoader] mmap/SHM error detected — "
+                              "falling back to num_workers=0, persistent_workers=False")
+                    # Rebuild kwargs cleanly without MP-only args
+                    dl_kwargs = dict(num_workers=0, pin_memory=True)
+                    try:
+                        dl_kwargs["pin_memory_device"] = f"cuda:{rank}"
+                    except TypeError:
+                        pass
+                    return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                                      drop_last=drop_last, **dl_kwargs)
+                raise
+
+        # Build loaders with robust fallback
+        train_dl = _safe_make_dataloader(train_dataset, train_sampler, PER_RANK_BATCH, drop_last=True)
+        test_dl  = _safe_make_dataloader(test_dataset,  test_sampler,  PER_RANK_BATCH, drop_last=False)
 
         # Param groups
         vis_params, text_params = [], []
@@ -673,15 +786,25 @@ def main_worker(rank, world_size):
             else:
                 vis_params.append(p)
 
+
+        _adamw_kwargs = dict(weight_decay=WEIGHT_DECAY)
+        try: _adamw_kwargs.update(dict(fused=True))
+        except TypeError: pass  # fused not supported on this torch
+
         opt = torch.optim.AdamW(
             [
                 {"params": vis_params,  "lr": LR_IMG},
                 {"params": text_params, "lr": LR_TEXT},
                 {"params": gain_param,  "lr": LR_GAIN},
             ],
-            weight_decay=WEIGHT_DECAY,
+            # weight_decay=WEIGHT_DECAY,
+            **_adamw_kwargs,
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3, min_lr=1e-6)
+        # AMP setup
+        use_amp  = (torch.cuda.is_available() and USE_AMP)
+        use_bf16 = (use_amp and torch.cuda.is_bf16_supported())
+        scaler   = GradScaler(enabled=(use_amp and not use_bf16))
 
         # State vars
         start_epoch = 1
@@ -691,11 +814,16 @@ def main_worker(rank, world_size):
         warmup_done = False
         warmup_epochs_completed = 0
 
-        # Optional resume (rank 0 loads; then broadcast)
-        if rank == 0 and CKPT_FILE.exists():
-            print(f"[resume] loading {CKPT_FILE.name}")
+        # Optional resume — have *all ranks* load the same state.
+        # Load into the *base* module even if compiled/wrapped by DDP.
+        if CKPT_FILE.exists():
+            if rank == 0:
+                print(f"[resume] loading {CKPT_FILE.name}")
             state = torch.load(CKPT_FILE, map_location=dev)
-            model_ddp.module.load_state_dict(state["model"])
+            _base = getattr(model_ddp.module, "_orig_mod", model_ddp.module)
+            missing, unexpected = _base.load_state_dict(state["model"], strict=False)
+            if rank == 0 and (missing or unexpected):
+                print(f"[resume] load_state_dict: missing={list(missing)}, unexpected={list(unexpected)}")
             # Try optimizer state; fall back gracefully on group mismatch
             try:
                 opt.load_state_dict(state["opt"])
@@ -812,6 +940,8 @@ def main_worker(rank, world_size):
             # Keep all ranks in lock-step at the epoch boundary
             if dist.is_available() and dist.is_initialized(): dist.barrier()
             train_sampler.set_epoch(ep)
+            # Keep validation sharding deterministic per epoch as well
+            test_sampler.set_epoch(ep)
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(dev)
 
@@ -837,55 +967,81 @@ def main_worker(rank, world_size):
             run, run_main, tot = 0., 0., 0
             pbar = tqdm(train_dl, desc=f"[Rank {rank}] Ep{ep}", leave=False)
             for step, (img, clip_ids, gt, _, img_id, _sid) in enumerate(pbar, 1):
-                img, clip_ids, gt = img.to(dev), clip_ids.to(dev), gt.to(dev)
-                prob = model_ddp(img, clip_ids)  # model currently returns prob
-                # turn prob -> logits safely so combo_loss sees logits
-                eps = 1e-6
-                logits = torch.log(prob.clamp(eps,1-eps) / (1 - prob.clamp(eps,1-eps)))
+                img = img.to(dev, non_blocking=True)
+                if USE_CHANNELS_LAST and img.dim() == 4: img = img.contiguous(memory_format=torch.channels_last)
+                clip_ids = clip_ids.to(dev, non_blocking=True)
+                gt  = gt.to(dev, non_blocking=True)
+                # forward (AMP) — use the compatibility shim
+                autocast_cm = (_autocast_impl(dtype=(torch.bfloat16 if use_bf16 else torch.float16))
+                               if use_amp else nullcontext())
+                with autocast_cm:
+                    prob = model_ddp(img, clip_ids)  # returns prob
+                    logits = torch.logit(prob.clamp(1e-6, 1-1e-6))
 
                 loss_main = combo_loss(logits, gt)
                 run_main += loss_main.item() * img.size(0)
 
-                # TV loss (small)
+                # TV loss (small) — keep grads through text, no grads through vision pool
                 with torch.no_grad():
                     vis_feat = backbone_pool(model_ddp.module, img)
                     vis_feat = model_ddp.module.tv_proj(vis_feat)
-                txt_feat = model_ddp.module.film.clip.encode_text(clip_ids)
-                loss_tv   = TV_W       * contrastive_tv_loss(vis_feat, txt_feat)
+                with autocast_cm:
+                    # Avoid a second gradient path through CLIP during main training
+                    # (CLIP text tower can still be warmed up earlier).
+                    txt_feat = model_ddp.module.film.clip.encode_text(clip_ids).detach()
+                    loss_tv   = TV_W * contrastive_tv_loss(vis_feat, txt_feat)
 
                 # Priors (use prob)
                 loss_area = REG_W_AREA * mask_area_loss(prob, gt)
                 loss_com  = REG_W_COM  * com_alignment_loss(prob, gt)
 
-                # Divergence per image-id (use prob)
-                idx_by_img = {}; div_acc = pairs = 0.
+                # Divergence per image-id (vectorized; identical objective)
+                idx_by_img = {}; div_sum = prob.new_tensor(0.); pair_count = prob.new_tensor(0.)
                 for k, iid in enumerate(img_id): idx_by_img.setdefault(int(iid), []).append(k)
                 for idxs in idx_by_img.values():
-                    for i in range(len(idxs)):
-                        for j in range(i+1, len(idxs)):
-                            i1, i2 = idxs[i], idxs[j]
-                            if torch.equal(gt[i1], gt[i2]): continue
-                            div_acc += (prob[i1] - prob[i2]).abs().mean()
-                            pairs += 1
-                div_loss = (div_acc / pairs) if pairs else torch.tensor(0., device=dev)
+                    k = len(idxs)
+                    if k < 2: continue
+                    P = prob[idxs, 0]  # [k,H,W]
+                    # exclude identical GT pairs (rare in-batch); quick mask
+                    G = gt[idxs, 0]
+                    # build pairwise mask: keep pairs with different GT
+                    diff_gt = (G[:,None] - G[None,:]).abs().sum(dim=(2,3)) > 0  # [k,k]
+                    iu = torch.triu_indices(k, k, offset=1, device=dev)
+                    sel = diff_gt[iu[0], iu[1]]
+                    if sel.any():
+                        D = (P[:,None] - P[None,:]).abs()  # [k,k,H,W]
+                        pair_vals = D[iu[0][sel], iu[1][sel]]        # [p,H,W]
+                        div_sum += pair_vals.mean(dim=(1,2)).sum()   # sum of per-pair means
+                        pair_count += sel.sum()
+                div_loss = (div_sum / pair_count) if pair_count.item() > 0 else prob.new_tensor(0.)
 
                 # FiLM regulariser on squashed values
                 gE, bE, gD, bD = model_ddp.module.film(clip_ids)
                 gE, bE, gD, bD = squash_film_lists(gE, bE, gD, bD)
                 reg_term = film_reg(gE + gD, bE + bD, w=REG_W_FiLM)
 
-                loss = (loss_main
+                loss_total = (loss_main
                         + λ_div * div_loss
                         + reg_term + loss_tv + loss_area + loss_com)
+                
+                backward_loss = loss_total / ACC_STEPS
 
                 # Backward with correct DDP grad-accumulation semantics:
                 # only sync on the final micro-step of each accumulation window
                 sync_now = (step % ACC_STEPS == 0) or (step == len(train_dl))
                 with (model_ddp.no_sync() if not sync_now else nullcontext()):
-                    loss.backward()
+                    if scaler.is_enabled():
+                        scaler.scale(backward_loss).backward()
+                    else:
+                        backward_loss.backward()
                 if sync_now:
+                    if scaler.is_enabled():
+                        scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model_ddp.parameters(), clip_norm_cur)
-                    opt.step()
+                    if scaler.is_enabled():
+                        scaler.step(opt); scaler.update()
+                    else:
+                        opt.step()
                     # (we rely on squashing; no hard clamp here)
                     opt.zero_grad(set_to_none=True)
                      # --- Debug: surface any grad-enabled params that didn't receive grads this step (rank 0 only)
@@ -899,7 +1055,7 @@ def main_worker(rank, world_size):
                             head = ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")
                             print(f"[DDP][debug] {len(missing)} grad-enabled params had no grad on this sync: {head}")
 
-                run += loss.item() * img.size(0)
+                run += loss_total.item() * img.size(0)
                 tot += img.size(0)
                 pbar.set_postfix(
                     Lmain=f"{loss_main.item():.3f}",
@@ -923,11 +1079,13 @@ def main_worker(rank, world_size):
             with torch.no_grad():
                 pbar_v = tqdm(test_dl, desc=f"[Rank {rank}] Val Ep{ep}", leave=False)
                 for img, clip_ids, gt, _, img_id, _sid in pbar_v:
-                    img, clip_ids, gt = img.to(dev), clip_ids.to(dev), gt.to(dev)
-                    prob_val = model_ddp(img, clip_ids)
-                    eps = 1e-6
-                    logits_val = torch.log(prob_val.clamp(eps,1-eps) / (1 - prob_val.clamp(eps,1-eps)))
-                    v_loss = combo_loss(logits_val, gt)
+                    img = img.to(dev, non_blocking=True)
+                    if USE_CHANNELS_LAST and img.dim() == 4: img = img.contiguous(memory_format=torch.channels_last)
+                    clip_ids, gt = clip_ids.to(dev, non_blocking=True), gt.to(dev, non_blocking=True)
+                    with (_autocast_impl(dtype=(torch.bfloat16 if use_bf16 else torch.float16)) if use_amp else nullcontext()):
+                        prob_val = model_ddp(img, clip_ids)
+                        logits_val = torch.logit(prob_val.clamp(1e-6,1-1e-6))
+                        v_loss = combo_loss(logits_val, gt)
                     v_sum += v_loss * img.size(0)
                     v_n   += img.size(0)
             dist.all_reduce(v_sum, op=dist.ReduceOp.SUM)
@@ -1072,19 +1230,19 @@ def main_worker(rank, world_size):
                     keep_history=False,
                     save_best=improved
                 )
-                # Synchronize after rank-0 I/O (ckpt, logging, optional viz)
-                if dist.is_available() and dist.is_initialized(): dist.barrier()
-                
+            # Synchronize after rank-0 I/O (ckpt, logging, optional viz)
+            if dist.is_available() and dist.is_initialized(): dist.barrier()
+            
 
-                # --- Early stopping decision (rank 0 decides, broadcast to all) ---
-                if rank == 0 and patience >= PATIENCE_MAX:
-                    print(f"[EarlyStop] No val improvement for {patience} epochs "
-                          f"(≥ PATIENCE_MAX={PATIENCE_MAX}). Stopping.")
-                stop_t = torch.tensor(1 if (rank == 0 and patience >= PATIENCE_MAX) else 0,
-                                      device=dev, dtype=torch.long)
-                dist.broadcast(stop_t, src=0)
-                if stop_t.item() == 1:
-                    break
+            # --- Early stopping decision (rank 0 decides, broadcast to all) ---
+            if rank == 0 and patience >= PATIENCE_MAX:
+                print(f"[EarlyStop] No val improvement for {patience} epochs "
+                        f"(≥ PATIENCE_MAX={PATIENCE_MAX}). Stopping.")
+            stop_t = torch.tensor(1 if (rank == 0 and patience >= PATIENCE_MAX) else 0,
+                                    device=dev, dtype=torch.long)
+            dist.broadcast(stop_t, src=0)
+            if stop_t.item() == 1:
+                break
 
             # Broadcast updated small state so all ranks match decisions
             best_val_t = torch.tensor(best_val, device=dev, dtype=torch.float32)
